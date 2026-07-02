@@ -1,0 +1,12 @@
+# Soccer foul detection pipeline - Python dependencies
+#
+# PyTorch is NOT installed from this file. Install it separately with CUDA 11.8 support:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu118
+# torch==2.7.1  (installed via the index URL above, not from PyPI directly)
+
+transformers==4.53.0        # CLIP (openai/clip-vit-base-patch32) and VideoMAE (MCG-NJU/videomae-base-finetuned-kinetics)
+accelerate==1.8.1           # HuggingFace model loading / device placement
+opencv-python==4.11.0.86    # frame extraction + Farneback optical flow
+decord==0.6.0               # fast video loading
+numpy==1.26.4               # pinned <2 for decord binary compatibility
+Pillow==10.4.0              # image handling for CLIP preprocessing

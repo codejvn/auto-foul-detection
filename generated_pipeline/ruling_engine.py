@@ -1,0 +1,350 @@
+"""
+ruling_engine.py
+
+Final deterministic decision layer for the local soccer foul-detection
+pipeline. This module takes the outputs of upstream ML modules (contact
+detection, foul classification, severity estimation, and location
+detection) and produces a single, auditable ruling.
+
+===========================================================================
+SWAP HOOK
+===========================================================================
+This module is intentionally NOT swappable for an ML model. Every upstream
+stage (contact, foul type, severity, location) is allowed to be a learned
+model, but the final decision -- turning those signals into a punishment --
+must remain deterministic, explainable, and auditable (IFAB-style rules).
+Referee-facing / compliance-facing systems need a decision layer that can
+be inspected line-by-line, not a black box.
+
+To change ruling behavior, DO NOT swap in a model here. Instead edit the
+module-level `PUNISHMENT_TABLE` constant (and the special-case handling in
+`make_ruling` for simulation / penalty-box upgrades) to reflect the desired
+rule changes.
+===========================================================================
+"""
+
+import math
+from typing import Dict, Union
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+#: Valid foul type labels produced by the upstream foul classification module.
+VALID_FOUL_TYPES = frozenset({
+    "tackle",
+    "handball",
+    "obstruction",
+    "simulation",
+    "push",
+    "none",
+})
+
+#: Valid severity labels produced by the upstream severity estimation module.
+VALID_SEVERITIES = frozenset({
+    "careless",
+    "reckless",
+    "excessive_force",
+})
+
+#: Foul types that do NOT require player-to-player contact to be ruled a foul.
+#: Handballs are contact-with-ball (not player) events, and simulation is by
+#: definition an absence of genuine contact.
+CONTACT_EXEMPT_FOUL_TYPES = frozenset({"handball", "simulation"})
+
+#: Base punishment for each severity level, per IFAB-style disciplinary
+#: guidance. This is the single point of control for changing punishment
+#: outcomes -- see the SWAP HOOK note above.
+PUNISHMENT_TABLE: Dict[str, str] = {
+    "careless": "free kick",
+    "reckless": "free kick + yellow card",
+    "excessive_force": "free kick + red card",
+}
+
+#: Confidence values are clamped to this range before use in the geometric
+#: mean calculation, to guard against zero, negative, or otherwise malformed
+#: upstream confidence scores.
+MIN_CONFIDENCE = 0.01
+MAX_CONFIDENCE = 1.0
+
+#: Punishment issued for a foul detected while officially "no foul" applies.
+PLAY_ON = "play on"
+
+#: Fixed punishment for simulation, regardless of severity or location.
+SIMULATION_PUNISHMENT = "free kick + yellow card (simulation)"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _clamp_confidence(value: Union[int, float]) -> float:
+    """Clamp a confidence score into the valid [MIN_CONFIDENCE, MAX_CONFIDENCE] range.
+
+    Args:
+        value: A raw confidence score, potentially zero, negative, or
+            greater than 1.0 due to upstream noise.
+
+    Returns:
+        The confidence clamped into [MIN_CONFIDENCE, MAX_CONFIDENCE].
+    """
+    return min(MAX_CONFIDENCE, max(MIN_CONFIDENCE, float(value)))
+
+
+def _geometric_mean(confidences: list) -> float:
+    """Compute the geometric mean of a list of confidence scores.
+
+    Each input is clamped to [MIN_CONFIDENCE, MAX_CONFIDENCE] before the
+    product is taken, guaranteeing the product is always positive and the
+    n-th root is well defined.
+
+    Args:
+        confidences: A non-empty list of raw confidence scores.
+
+    Returns:
+        The geometric mean of the clamped confidence scores.
+
+    Raises:
+        ValueError: If `confidences` is empty.
+    """
+    if not confidences:
+        raise ValueError("Cannot compute geometric mean of an empty confidence list")
+    clamped = [_clamp_confidence(c) for c in confidences]
+    product = math.prod(clamped)
+    return math.pow(product, 1.0 / len(clamped))
+
+
+def _validate_foul_type(foul_type: str) -> None:
+    """Validate that a foul type string is recognized.
+
+    Args:
+        foul_type: The foul type string to validate.
+
+    Raises:
+        ValueError: If `foul_type` is not one of VALID_FOUL_TYPES.
+    """
+    if foul_type not in VALID_FOUL_TYPES:
+        raise ValueError(
+            f"Unknown foul_type {foul_type!r}; expected one of "
+            f"{sorted(VALID_FOUL_TYPES)}"
+        )
+
+
+def _validate_severity(severity: str) -> None:
+    """Validate that a severity string is recognized.
+
+    Args:
+        severity: The severity string to validate.
+
+    Raises:
+        ValueError: If `severity` is not one of VALID_SEVERITIES.
+    """
+    if severity not in VALID_SEVERITIES:
+        raise ValueError(
+            f"Unknown severity {severity!r}; expected one of "
+            f"{sorted(VALID_SEVERITIES)}"
+        )
+
+
+def _build_punishment(foul_type: str, severity: str, in_penalty_box: bool) -> str:
+    """Construct the punishment string for a confirmed foul.
+
+    Args:
+        foul_type: The foul type of the confirmed foul (must not be 'none').
+        severity: The severity level of the foul.
+        in_penalty_box: Whether the foul occurred inside the penalty box.
+
+    Returns:
+        The punishment string, with 'free kick' upgraded to 'penalty kick'
+        when the foul occurred in the penalty box (except for simulation,
+        which always keeps its fixed punishment).
+    """
+    if foul_type == "simulation":
+        # Simulation is punished on the simulating player regardless of
+        # location; it never becomes a penalty kick.
+        return SIMULATION_PUNISHMENT
+
+    punishment = PUNISHMENT_TABLE[severity]
+    if in_penalty_box:
+        punishment = punishment.replace("free kick", "penalty kick")
+    return punishment
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def make_ruling(contact: dict, foul: dict, severity: dict, location: dict) -> dict:
+    """Produce the final deterministic ruling for a candidate foul event.
+
+    This is the sole public entry point of the ruling engine. It combines
+    the outputs of the contact detection, foul classification, severity
+    estimation, and location detection modules into a single ruling dict
+    using fixed, auditable IFAB-style rules.
+
+    Rules applied:
+        - A foul is detected only if foul_type != 'none' AND
+          (contact['contact'] is True OR foul_type is in
+          {'handball', 'simulation'}), since handballs and simulation do
+          not require player-to-player contact.
+        - Punishment is looked up from PUNISHMENT_TABLE by severity.
+        - Simulation always yields 'free kick + yellow card (simulation)'
+          and is never upgraded to a penalty kick.
+        - Any other foul committed inside the penalty box has 'free kick'
+          upgraded to 'penalty kick' in its punishment string.
+        - If no foul is detected, punishment is 'play on', foul_type is
+          normalized to 'none', severity is floored to 'careless', and
+          in_penalty_box is passed through unchanged.
+        - Overall confidence is the geometric mean of the confidences of
+          only the modules that actually contributed to the decision.
+
+    Args:
+        contact: Dict with keys 'contact' (bool) and 'confidence' (float),
+            from the contact detection module.
+        foul: Dict with keys 'foul_type' (str, one of VALID_FOUL_TYPES) and
+            'confidence' (float), from the foul classification module.
+        severity: Dict with keys 'severity' (str, one of VALID_SEVERITIES),
+            'confidence' (float), and 'peak_motion' (float), from the
+            severity estimation module.
+        location: Dict with keys 'in_penalty_box' (bool) and 'confidence'
+            (float), from the location detection module.
+
+    Returns:
+        A dict with keys:
+            'foul_detected' (bool): Whether a punishable foul occurred.
+            'foul_type' (str): The ruled foul type ('none' if no foul).
+            'severity' (str): The ruled severity ('careless' if no foul).
+            'in_penalty_box' (bool): Passed through from `location`.
+            'punishment' (str): The final punishment string.
+            'confidence' (float): Geometric mean confidence of the
+                contributing modules.
+
+    Raises:
+        ValueError: If foul['foul_type'] or severity['severity'] is not a
+            recognized value.
+    """
+    foul_type = foul["foul_type"]
+    severity_level = severity["severity"]
+
+    _validate_foul_type(foul_type)
+    _validate_severity(severity_level)
+
+    has_contact = bool(contact["contact"])
+    in_penalty_box = bool(location["in_penalty_box"])
+
+    foul_detected = (foul_type != "none") and (
+        has_contact or foul_type in CONTACT_EXEMPT_FOUL_TYPES
+    )
+
+    if not foul_detected:
+        ruling_foul_type = "none"
+        ruling_severity = "careless"
+        punishment = PLAY_ON
+        contributing_confidences = [foul["confidence"], contact["confidence"]]
+    else:
+        ruling_foul_type = foul_type
+        ruling_severity = severity_level
+        punishment = _build_punishment(foul_type, severity_level, in_penalty_box)
+        contributing_confidences = [
+            foul["confidence"],
+            contact["confidence"],
+            severity["confidence"],
+            location["confidence"],
+        ]
+
+    overall_confidence = _geometric_mean(contributing_confidences)
+
+    return {
+        "foul_detected": foul_detected,
+        "foul_type": ruling_foul_type,
+        "severity": ruling_severity,
+        "in_penalty_box": in_penalty_box,
+        "punishment": punishment,
+        "confidence": overall_confidence,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Smoke test
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    scenarios = []
+
+    # 1. Reckless tackle outside the box -> free kick + yellow card.
+    scenarios.append((
+        "reckless tackle outside box",
+        dict(contact={"contact": True, "confidence": 0.92}, foul={"foul_type": "tackle", "confidence": 0.88},
+             severity={"severity": "reckless", "confidence": 0.81, "peak_motion": 0.55},
+             location={"in_penalty_box": False, "confidence": 0.95}),
+        "free kick + yellow card",
+    ))
+
+    # 2. Excessive-force tackle inside the box -> penalty kick + red card.
+    scenarios.append((
+        "excessive-force tackle inside box",
+        dict(contact={"contact": True, "confidence": 0.97}, foul={"foul_type": "tackle", "confidence": 0.93},
+             severity={"severity": "excessive_force", "confidence": 0.89, "peak_motion": 0.97},
+             location={"in_penalty_box": True, "confidence": 0.90}),
+        "penalty kick + red card",
+    ))
+
+    # 3. Simulation inside the box -> stays a yellow card, not a penalty.
+    scenarios.append((
+        "simulation inside box",
+        dict(contact={"contact": False, "confidence": 0.60}, foul={"foul_type": "simulation", "confidence": 0.77},
+             severity={"severity": "careless", "confidence": 0.70, "peak_motion": 0.10},
+             location={"in_penalty_box": True, "confidence": 0.85}),
+        "free kick + yellow card (simulation)",
+    ))
+
+    # 4. Handball without contact -> still a foul (contact-exempt), free kick.
+    scenarios.append((
+        "handball without contact",
+        dict(contact={"contact": False, "confidence": 0.55}, foul={"foul_type": "handball", "confidence": 0.80},
+             severity={"severity": "careless", "confidence": 0.65, "peak_motion": 0.05},
+             location={"in_penalty_box": False, "confidence": 0.88}),
+        "free kick",
+    ))
+
+    # 5. No foul -> play on.
+    scenarios.append((
+        "no foul",
+        dict(contact={"contact": True, "confidence": 0.70}, foul={"foul_type": "none", "confidence": 0.91},
+             severity={"severity": "careless", "confidence": 0.50, "peak_motion": 0.02},
+             location={"in_penalty_box": False, "confidence": 0.60}),
+        "play on",
+    ))
+
+    for name, kwargs, expected_punishment in scenarios:
+        result = make_ruling(**kwargs)
+        print(f"[{name}] -> {result}")
+        assert result["punishment"] == expected_punishment, (
+            f"Scenario '{name}' expected punishment {expected_punishment!r}, "
+            f"got {result['punishment']!r}"
+        )
+
+    # Sanity check: invalid foul_type / severity should raise ValueError.
+    try:
+        make_ruling(
+            contact={"contact": True, "confidence": 0.9},
+            foul={"foul_type": "dive", "confidence": 0.9},
+            severity={"severity": "careless", "confidence": 0.9, "peak_motion": 0.1},
+            location={"in_penalty_box": False, "confidence": 0.9},
+        )
+        raise AssertionError("Expected ValueError for invalid foul_type")
+    except ValueError:
+        pass
+
+    try:
+        make_ruling(
+            contact={"contact": True, "confidence": 0.9},
+            foul={"foul_type": "tackle", "confidence": 0.9},
+            severity={"severity": "brutal", "confidence": 0.9, "peak_motion": 0.1},
+            location={"in_penalty_box": False, "confidence": 0.9},
+        )
+        raise AssertionError("Expected ValueError for invalid severity")
+    except ValueError:
+        pass
+
+    print("\nAll smoke tests passed.")

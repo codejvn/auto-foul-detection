@@ -1,0 +1,122 @@
+{
+  "architecture_summary": "A fully local, GPU-accelerated soccer foul detection pipeline: OpenCV extracts 16 evenly-spaced RGB frames from the input clip; CLIP (openai/clip-vit-base-patch32) zero-shot heads detect player contact and penalty-box location; VideoMAE (MCG-NJU/videomae-base-finetuned-kinetics) classifies foul type via a Kinetics-to-foul label mapping; dense Farneback optical flow drives a deterministic severity heuristic; and a pure-Python IFAB-style ruling engine combines all signals into a final punishment ruling with confidence. Every ML module caches its model as a module-level singleton and exposes a MODEL_ID string constant at the top of the file as the swap hook for fine-tuned replacements.",
+  "public_api": {
+    "frame_extractor.py": "extract_frames(video_path: str, num_frames: int = 16) -> tuple[list[np.ndarray], list[float]]  # RGB uint8 HxWx3 frames, timestamps in seconds",
+    "contact_detector.py": "detect_contact(frames: list[np.ndarray]) -> dict  # {\"contact\": bool, \"confidence\": float}",
+    "foul_classifier.py": "classify_foul(frames: list[np.ndarray]) -> dict  # {\"foul_type\": str one of tackle|handball|obstruction|simulation|push|none, \"confidence\": float}",
+    "severity_assessor.py": "assess_severity(frames: list[np.ndarray], foul_type: str) -> dict  # {\"severity\": str one of careless|reckless|excessive_force, \"confidence\": float, \"peak_motion\": float}",
+    "location_detector.py": "detect_location(frames: list[np.ndarray]) -> dict  # {\"in_penalty_box\": bool, \"confidence\": float}",
+    "ruling_engine.py": "make_ruling(contact: dict, foul: dict, severity: dict, location: dict) -> dict  # {\"foul_detected\": bool, \"foul_type\": str, \"severity\": str, \"in_penalty_box\": bool, \"punishment\": str, \"confidence\": float}",
+    "pipeline.py": "run_pipeline(video_path: str, num_frames: int = 16) -> dict  # final ruling dict; also a CLI: python pipeline.py clip.mp4"
+  },
+  "modules": [
+    {
+      "filename": "frame_extractor.py",
+      "model": "none — pure OpenCV",
+      "inputs": "video_path: str, num_frames: int = 16",
+      "outputs": "frames: list[np.ndarray] (RGB uint8 HxWx3), timestamps: list[float] (seconds)",
+      "key_decisions": [
+        "Sample num_frames evenly spaced by frame index across the full clip using cv2.CAP_PROP_FRAME_COUNT",
+        "Convert BGR to RGB before returning so downstream HuggingFace processors get RGB",
+        "If a frame read fails (corrupt frame), reuse the last successfully decoded frame and continue; raise ValueError only if zero frames decode",
+        "Raise FileNotFoundError for a missing video path with a clear message",
+        "Timestamps computed from frame index / fps, falling back to index-based estimates when fps metadata is missing"
+      ],
+      "swap_hook_description": "No ML model, but include a SWAP HOOK comment block explaining how to replace uniform sampling with a learned keyframe selector (e.g., a fine-tuned action-proposal model) by reimplementing the frame-index selection function."
+    },
+    {
+      "filename": "contact_detector.py",
+      "model": "openai/clip-vit-base-patch32",
+      "inputs": "frames: list[np.ndarray]",
+      "outputs": "{\"contact\": bool, \"confidence\": float}",
+      "key_decisions": [
+        "Zero-shot CLIP with contrastive text prompts: positive prompts describe two soccer players in physical contact / colliding / tackling, negative prompts describe players running with no contact",
+        "Score every frame, take the max positive-prompt softmax probability across frames as the contact confidence (contact is momentary, so max not mean)",
+        "contact = confidence >= 0.5",
+        "Model + processor cached as module-level singletons loaded on first call, moved to cuda if available with graceful CPU fallback"
+      ],
+      "swap_hook_description": "MODEL_ID = \"openai/clip-vit-base-patch32\" string constant at top of file; SWAP HOOK comment shows changing it to a fine-tuned checkpoint (e.g., your-org/clip-soccer-contact) and notes that prompt lists can also be tuned."
+    },
+    {
+      "filename": "foul_classifier.py",
+      "model": "MCG-NJU/videomae-base-finetuned-kinetics",
+      "inputs": "frames: list[np.ndarray]",
+      "outputs": "{\"foul_type\": str (tackle|handball|obstruction|simulation|push|none), \"confidence\": float}",
+      "key_decisions": [
+        "VideoMAE expects exactly 16 frames; pad by repeating the last frame or subsample evenly if given a different count",
+        "Pre-trained head outputs Kinetics-400 action labels, not foul types: map top-k predicted Kinetics labels to foul types via a keyword mapping dict (e.g., labels containing 'tackl' -> tackle, 'wrestling'/'push' -> push, 'juggling soccer ball'/'kicking' with low motion -> none), defaulting to 'none' when no mapped label appears in top-5",
+        "Return the softmax probability mass of the winning mapped label group as confidence",
+        "This mapping is explicitly a stopgap: the real accuracy comes from the SoccerNet fine-tune described in the swap hook"
+      ],
+      "swap_hook_description": "MODEL_ID = \"MCG-NJU/videomae-base-finetuned-kinetics\" constant at top; SWAP HOOK comment block shows switching to a SoccerNet fine-tuned checkpoint with a direct 6-class head (tackle/handball/obstruction/simulation/push/none) and deleting the Kinetics keyword-mapping function."
+    },
+    {
+      "filename": "severity_assessor.py",
+      "model": "none — OpenCV Farneback dense optical flow",
+      "inputs": "frames: list[np.ndarray], foul_type: str",
+      "outputs": "{\"severity\": str (careless|reckless|excessive_force), \"confidence\": float, \"peak_motion\": float}",
+      "key_decisions": [
+        "Compute dense Farneback optical flow between consecutive grayscale frame pairs (downscaled to width 320 for speed); severity signal = peak of the 95th-percentile flow magnitude across pairs, normalized by frame diagonal",
+        "Thresholds on normalized peak motion: < 0.010 -> careless, 0.010–0.025 -> reckless, > 0.025 -> excessive_force",
+        "Foul-type-aware overrides: simulation is always careless (no real contact); handball capped at reckless (severity of handball is about denial, not force)",
+        "Confidence derived from distance of the motion value from the nearest threshold boundary (values near a boundary get ~0.5, far from boundaries approach 0.9)"
+      ],
+      "swap_hook_description": "SWAP HOOK comment block shows replacing the heuristic with a fine-tuned video regression/classification model: add MODEL_ID constant (placeholder string provided, e.g. \"your-org/videomae-severity\"), and reimplement assess_severity to call it, keeping the same return dict."
+    },
+    {
+      "filename": "location_detector.py",
+      "model": "openai/clip-vit-base-patch32",
+      "inputs": "frames: list[np.ndarray]",
+      "outputs": "{\"in_penalty_box\": bool, \"confidence\": float}",
+      "key_decisions": [
+        "Zero-shot CLIP with contrastive prompts: positive prompts describe play inside the penalty area near the goal with the goalkeeper and penalty-box lines visible, negative prompts describe midfield play far from goal",
+        "Use the middle 50% of frames (the foul moment) and average the positive-prompt softmax probability (location is stable across the incident, so mean not max)",
+        "in_penalty_box = confidence >= 0.5",
+        "Loads its own CLIP singleton independently of contact_detector so each module file is fully self-contained (HuggingFace disk cache makes the second load cheap; both fit in the VRAM budget)"
+      ],
+      "swap_hook_description": "MODEL_ID = \"openai/clip-vit-base-patch32\" constant at top; SWAP HOOK comment shows swapping to a fine-tuned pitch-localization model (e.g., a keypoint/homography model trained on SoccerNet-calibration) while keeping the same return dict."
+    },
+    {
+      "filename": "ruling_engine.py",
+      "model": "none — pure Python rule logic, deterministic, no ML imports",
+      "inputs": "contact: dict, foul: dict, severity: dict, location: dict (the outputs of the four upstream modules)",
+      "outputs": "{\"foul_detected\": bool, \"foul_type\": str, \"severity\": str, \"in_penalty_box\": bool, \"punishment\": str, \"confidence\": float}",
+      "key_decisions": [
+        "foul_detected = (foul_type != 'none') AND (contact OR foul_type in {handball, simulation}) — handball and simulation do not require player-to-player contact",
+        "IFAB-style punishment mapping: careless -> 'free kick'; reckless -> 'free kick + yellow card'; excessive_force -> 'free kick + red card'; simulation -> 'free kick + yellow card (simulation)'",
+        "If in_penalty_box and foul_detected and foul_type != simulation: replace 'free kick' with 'penalty kick' in the punishment string; excessive force in the box -> 'penalty kick + red card'",
+        "If no foul: punishment = 'play on', foul_type = 'none', severity passed through as 'careless' floor",
+        "Overall confidence = geometric mean of the confidences of the modules that actually contributed to the decision",
+        "Zero ML imports — only stdlib (math) — so this file is trivially unit-testable"
+      ],
+      "swap_hook_description": "SWAP HOOK comment block explains this module is intentionally NOT swappable for a model: rules stay deterministic and auditable; to change behavior, edit the PUNISHMENT_TABLE dict constant."
+    },
+    {
+      "filename": "pipeline.py",
+      "model": "none — orchestrator",
+      "inputs": "video_path: str (CLI argument), num_frames: int = 16 (--num-frames flag)",
+      "outputs": "final ruling dict printed as pretty JSON to stdout; run_pipeline() also returns it",
+      "key_decisions": [
+        "Imports the five sibling modules directly (from frame_extractor import extract_frames, etc.) and calls them in sequence: extract -> contact -> foul -> severity -> location -> ruling",
+        "Sequential execution (not parallel) to bound peak VRAM to one model's activations at a time; models stay resident as singletons",
+        "argparse CLI: python pipeline.py clip.mp4 [--num-frames 16]; exits with code 1 and a readable message on missing/corrupt video",
+        "Prints per-stage progress lines to stderr and only the final JSON dict to stdout so output is pipeable",
+        "Adds the directory containing pipeline.py to sys.path so it works when invoked from any cwd"
+      ],
+      "swap_hook_description": "SWAP HOOK comment block notes that stages are swapped inside each module file (via their MODEL_ID constants), not here; the orchestrator only depends on the public function signatures listed in the architecture plan."
+    },
+    {
+      "filename": "requirements.txt",
+      "model": "none",
+      "inputs": "n/a",
+      "outputs": "pinned pip dependencies",
+      "key_decisions": [
+        "torch installed separately via the CUDA 11.8 index URL (comment at top of file)",
+        "Pin transformers, opencv-python, numpy, Pillow, decord, accelerate to versions stable as of mid-2025"
+      ],
+      "swap_hook_description": "n/a"
+    }
+  ],
+  "gpu_memory_estimate_gb": 4.5,
+  "recommended_num_frames": 16
+}

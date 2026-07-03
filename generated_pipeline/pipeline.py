@@ -4,8 +4,16 @@ This module is the single CLI entry point for the pipeline. It wires together th
 sibling stage modules in strict sequential order so that only one model needs to be
 resident on the GPU at a time, bounding peak VRAM usage:
 
-    extract_frames -> detect_contact -> classify_foul -> assess_severity
-        -> detect_location -> make_ruling
+    extract_frames -> filter_shot_boundaries -> detect_contact -> classify_foul
+        -> assess_severity -> detect_location
+        -> [evaluate_ambiguous_case, only if any module confidence < 0.65]
+        -> make_ruling
+
+The shot boundary filter removes frames that straddle a camera cut so every
+downstream module sees a single continuous shot. The judgment layer (Claude
+API) is consulted only for ambiguous cases -- when any of the four analysis
+modules reports confidence below the routing threshold (0.65); unambiguous
+cases go straight to the deterministic ruling engine.
 
 Usage:
     python pipeline.py clip.mp4 [--num-frames 16]
@@ -32,9 +40,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from contact_detector import detect_contact  # noqa: E402
 from foul_classifier import classify_foul  # noqa: E402
 from frame_extractor import extract_frames  # noqa: E402
+from judgment_layer import evaluate_ambiguous_case  # noqa: E402
 from location_detector import detect_location  # noqa: E402
-from ruling_engine import make_ruling  # noqa: E402
+from ruling_engine import LOW_CONFIDENCE_THRESHOLD, make_ruling  # noqa: E402
 from severity_assessor import assess_severity  # noqa: E402
+from shot_boundary_filter import filter_shot_boundaries  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # SWAP HOOK
@@ -96,68 +106,134 @@ def run_pipeline(video_path: str, num_frames: int = 16) -> dict[str, Any]:
     frame_count = 0
 
     # Stage 1: Frame extraction
-    _log("[1/6] Extracting frames...")
+    _log("[1/8] Extracting frames...")
     stage_start = time.perf_counter()
     try:
         frames, timestamps = extract_frames(video_path, num_frames=num_frames)
     except Exception as exc:  # noqa: BLE001 - intentionally broad to report stage
         raise PipelineStageError("extract_frames", exc) from exc
+    extracted_count = len(frames)
+    _log(
+        f"[1/8] Extracted {extracted_count} frames "
+        f"({time.perf_counter() - stage_start:.2f}s)"
+    )
+
+    # Stage 2: Shot boundary filtering (keep only the longest continuous shot)
+    _log("[2/8] Filtering shot boundaries...")
+    stage_start = time.perf_counter()
+    try:
+        frames, timestamps = filter_shot_boundaries(frames, timestamps)
+    except Exception as exc:  # noqa: BLE001
+        raise PipelineStageError("filter_shot_boundaries", exc) from exc
     frame_count = len(frames)
     _log(
-        f"[1/6] Extracted {frame_count} frames "
-        f"({time.perf_counter() - stage_start:.2f}s)"
+        f"[2/8] Kept {frame_count} of {extracted_count} frames from the "
+        f"longest continuous shot ({time.perf_counter() - stage_start:.2f}s)"
     )
     del timestamps  # not consumed downstream in this orchestrator
 
-    # Stage 2: Contact detection
-    _log("[2/6] Detecting contact...")
+    # Stage 3: Contact detection
+    _log("[3/8] Detecting contact...")
     stage_start = time.perf_counter()
     try:
         contact = detect_contact(frames)
     except Exception as exc:  # noqa: BLE001
         raise PipelineStageError("detect_contact", exc) from exc
-    _log(f"[2/6] Contact detection done ({time.perf_counter() - stage_start:.2f}s)")
+    _log(f"[3/8] Contact detection done ({time.perf_counter() - stage_start:.2f}s)")
 
-    # Stage 3: Foul classification
-    _log("[3/6] Classifying foul type...")
+    # Stage 4: Foul classification
+    _log("[4/8] Classifying foul type...")
     stage_start = time.perf_counter()
     try:
         foul = classify_foul(frames)
     except Exception as exc:  # noqa: BLE001
         raise PipelineStageError("classify_foul", exc) from exc
-    _log(f"[3/6] Foul classification done ({time.perf_counter() - stage_start:.2f}s)")
+    _log(f"[4/8] Foul classification done ({time.perf_counter() - stage_start:.2f}s)")
 
-    # Stage 4: Severity assessment (depends on classified foul type)
-    _log("[4/6] Assessing severity...")
+    # Stage 5: Severity assessment (depends on classified foul type)
+    _log("[5/8] Assessing severity...")
     stage_start = time.perf_counter()
     try:
         severity = assess_severity(frames, foul.get("foul_type", ""))
     except Exception as exc:  # noqa: BLE001
         raise PipelineStageError("assess_severity", exc) from exc
-    _log(f"[4/6] Severity assessment done ({time.perf_counter() - stage_start:.2f}s)")
+    _log(f"[5/8] Severity assessment done ({time.perf_counter() - stage_start:.2f}s)")
 
-    # Stage 5: Location detection
-    _log("[5/6] Detecting location...")
+    # Stage 6: Location detection
+    _log("[6/8] Detecting location...")
     stage_start = time.perf_counter()
     try:
         location = detect_location(frames)
     except Exception as exc:  # noqa: BLE001
         raise PipelineStageError("detect_location", exc) from exc
-    _log(f"[5/6] Location detection done ({time.perf_counter() - stage_start:.2f}s)")
+    _log(f"[6/8] Location detection done ({time.perf_counter() - stage_start:.2f}s)")
 
-    # Stage 6: Final ruling
-    _log("[6/6] Making ruling...")
+    # Stage 7: Confidence routing -> judgment layer for ambiguous cases only
+    named_outputs = [
+        ("contact_detector", contact),
+        ("foul_classifier", foul),
+        ("severity_assessor", severity),
+        ("location_detector", location),
+    ]
+    low_confidence_modules = [
+        name
+        for name, output in named_outputs
+        if float(output["confidence"]) < LOW_CONFIDENCE_THRESHOLD
+    ]
+
+    judgment: dict[str, Any] | None = None
+    if low_confidence_modules:
+        _log(
+            "[7/8] Judgment layer INVOKED: low-confidence modules "
+            f"(< {LOW_CONFIDENCE_THRESHOLD}): {', '.join(low_confidence_modules)}"
+        )
+        stage_start = time.perf_counter()
+        try:
+            judgment = evaluate_ambiguous_case(
+                {
+                    "contact": contact,
+                    "foul": foul,
+                    "severity": severity,
+                    "location": location,
+                    "low_confidence_modules": low_confidence_modules,
+                }
+            )
+            _log(
+                f"[7/8] Judgment layer done ({time.perf_counter() - stage_start:.2f}s)"
+            )
+        except Exception as exc:  # noqa: BLE001 - degrade, don't kill the run
+            judgment = None
+            _log(
+                f"[7/8] Warning: judgment layer failed ({exc}); proceeding "
+                "with module outputs only. The ruling will still flag the "
+                "low-confidence modules."
+            )
+    else:
+        _log(
+            "[7/8] Judgment layer SKIPPED: all module confidences >= "
+            f"{LOW_CONFIDENCE_THRESHOLD}"
+        )
+
+    # Stage 8: Final ruling
+    _log("[8/8] Making ruling...")
     stage_start = time.perf_counter()
     try:
-        ruling = make_ruling(contact, foul, severity, location)
+        ruling = make_ruling(
+            contact,
+            foul,
+            severity,
+            location,
+            judgment=judgment,
+            low_confidence_modules=low_confidence_modules,
+        )
     except Exception as exc:  # noqa: BLE001
         raise PipelineStageError("make_ruling", exc) from exc
-    _log(f"[6/6] Ruling complete ({time.perf_counter() - stage_start:.2f}s)")
+    _log(f"[8/8] Ruling complete ({time.perf_counter() - stage_start:.2f}s)")
 
     total_elapsed = time.perf_counter() - pipeline_start
     _log(
-        f"Summary: {frame_count} frames extracted, "
-        f"total elapsed {total_elapsed:.2f}s"
+        f"Summary: {extracted_count} frames extracted, {frame_count} kept "
+        f"after shot filtering, total elapsed {total_elapsed:.2f}s"
     )
 
     return ruling

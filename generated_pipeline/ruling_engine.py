@@ -24,7 +24,7 @@ rule changes.
 """
 
 import math
-from typing import Dict, Union
+from typing import Dict, List, Optional, Union
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -72,6 +72,15 @@ PLAY_ON = "play on"
 
 #: Fixed punishment for simulation, regardless of severity or location.
 SIMULATION_PUNISHMENT = "free kick + yellow card (simulation)"
+
+#: Per-module confidence threshold: any module reporting confidence below
+#: this is flagged in the ruling's `low_confidence_modules` list. Must stay
+#: in sync with the pipeline's judgment-layer routing threshold.
+LOW_CONFIDENCE_THRESHOLD = 0.65
+
+#: Overall-confidence threshold below which the ruling recommends human
+#: review (`human_review_recommended` = True).
+HUMAN_REVIEW_THRESHOLD = 0.60
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +155,34 @@ def _validate_severity(severity: str) -> None:
         )
 
 
+def _find_low_confidence_modules(
+    contact: dict, foul: dict, severity: dict, location: dict
+) -> List[str]:
+    """List the modules whose confidence falls below LOW_CONFIDENCE_THRESHOLD.
+
+    Args:
+        contact: Output dict of the contact detection module.
+        foul: Output dict of the foul classification module.
+        severity: Output dict of the severity estimation module.
+        location: Output dict of the location detection module.
+
+    Returns:
+        Module names (matching the pipeline's module naming) whose reported
+        confidence is below the threshold, in fixed pipeline order.
+    """
+    named_outputs = [
+        ("contact_detector", contact),
+        ("foul_classifier", foul),
+        ("severity_assessor", severity),
+        ("location_detector", location),
+    ]
+    return [
+        name
+        for name, output in named_outputs
+        if float(output["confidence"]) < LOW_CONFIDENCE_THRESHOLD
+    ]
+
+
 def _build_punishment(foul_type: str, severity: str, in_penalty_box: bool) -> str:
     """Construct the punishment string for a confirmed foul.
 
@@ -174,13 +211,23 @@ def _build_punishment(foul_type: str, severity: str, in_penalty_box: bool) -> st
 # Public API
 # ---------------------------------------------------------------------------
 
-def make_ruling(contact: dict, foul: dict, severity: dict, location: dict) -> dict:
+def make_ruling(
+    contact: dict,
+    foul: dict,
+    severity: dict,
+    location: dict,
+    judgment: Optional[dict] = None,
+    low_confidence_modules: Optional[List[str]] = None,
+) -> dict:
     """Produce the final deterministic ruling for a candidate foul event.
 
     This is the sole public entry point of the ruling engine. It combines
     the outputs of the contact detection, foul classification, severity
     estimation, and location detection modules into a single ruling dict
-    using fixed, auditable IFAB-style rules.
+    using fixed, auditable IFAB-style rules. When the (optional) judgment
+    layer was consulted for an ambiguous case, its foul_type/severity
+    override the corresponding module outputs -- but the IFAB rules applied
+    to those values are exactly the same.
 
     Rules applied:
         - A foul is detected only if foul_type != 'none' AND
@@ -208,6 +255,17 @@ def make_ruling(contact: dict, foul: dict, severity: dict, location: dict) -> di
             severity estimation module.
         location: Dict with keys 'in_penalty_box' (bool) and 'confidence'
             (float), from the location detection module.
+        judgment: Optional dict from the judgment layer with keys
+            'foul_type' (str), 'severity' (str), 'reasoning' (str), and
+            'confidence' (float). When provided, its foul_type and severity
+            REPLACE the foul/severity module outputs in the ruling logic
+            (the judgment layer may override those two judgment calls, but
+            never contact or location). None for unambiguous cases.
+        low_confidence_modules: Optional list of module names the caller
+            (the pipeline's confidence router) flagged as below the routing
+            threshold. When None, the list is derived here from the module
+            confidences using LOW_CONFIDENCE_THRESHOLD -- both paths yield
+            the same result for well-formed inputs.
 
     Returns:
         A dict with keys:
@@ -218,13 +276,25 @@ def make_ruling(contact: dict, foul: dict, severity: dict, location: dict) -> di
             'punishment' (str): The final punishment string.
             'confidence' (float): Geometric mean confidence of the
                 contributing modules.
+            'human_review_recommended' (bool): True when the overall
+                confidence is below HUMAN_REVIEW_THRESHOLD (0.60).
+            'judgment_layer_used' (bool): True when `judgment` was provided.
+            'judgment_layer_reasoning' (str | None): The judgment layer's
+                reasoning, or None when it was not consulted.
+            'low_confidence_modules' (list[str]): Names of modules whose
+                confidence fell below LOW_CONFIDENCE_THRESHOLD (0.65).
 
     Raises:
-        ValueError: If foul['foul_type'] or severity['severity'] is not a
-            recognized value.
+        ValueError: If the effective foul_type or severity (from the
+            modules, or from `judgment` when provided) is not a recognized
+            value.
     """
-    foul_type = foul["foul_type"]
-    severity_level = severity["severity"]
+    if judgment is not None:
+        foul_type = judgment["foul_type"]
+        severity_level = judgment["severity"]
+    else:
+        foul_type = foul["foul_type"]
+        severity_level = severity["severity"]
 
     _validate_foul_type(foul_type)
     _validate_severity(severity_level)
@@ -261,6 +331,16 @@ def make_ruling(contact: dict, foul: dict, severity: dict, location: dict) -> di
         "in_penalty_box": in_penalty_box,
         "punishment": punishment,
         "confidence": overall_confidence,
+        "human_review_recommended": overall_confidence < HUMAN_REVIEW_THRESHOLD,
+        "judgment_layer_used": judgment is not None,
+        "judgment_layer_reasoning": (
+            judgment["reasoning"] if judgment is not None else None
+        ),
+        "low_confidence_modules": (
+            list(low_confidence_modules)
+            if low_confidence_modules is not None
+            else _find_low_confidence_modules(contact, foul, severity, location)
+        ),
     }
 
 
@@ -344,6 +424,76 @@ if __name__ == "__main__":
             location={"in_penalty_box": False, "confidence": 0.9},
         )
         raise AssertionError("Expected ValueError for invalid severity")
+    except ValueError:
+        pass
+
+    # ------------------------------------------------------------------
+    # Confidence-routing fields (judgment layer + human review + flags)
+    # ------------------------------------------------------------------
+
+    # 6. No judgment: new fields present with their default values.
+    result = make_ruling(
+        contact={"contact": True, "confidence": 0.92},
+        foul={"foul_type": "tackle", "confidence": 0.88},
+        severity={"severity": "reckless", "confidence": 0.81, "peak_motion": 0.55},
+        location={"in_penalty_box": False, "confidence": 0.95},
+    )
+    assert result["judgment_layer_used"] is False
+    assert result["judgment_layer_reasoning"] is None
+    assert result["human_review_recommended"] is False
+    assert result["low_confidence_modules"] == []
+    print(f"[no judgment, all confident] -> {result}")
+
+    # 7. Judgment override: judgment's foul_type/severity drive the ruling
+    #    (module said reckless push; judge ruled excessive-force tackle).
+    judgment = {
+        "foul_type": "tackle",
+        "severity": "excessive_force",
+        "reasoning": "Studs-up contact at speed endangers the opponent's safety.",
+        "confidence": 0.72,
+    }
+    result = make_ruling(
+        contact={"contact": True, "confidence": 0.90},
+        foul={"foul_type": "push", "confidence": 0.52},
+        severity={"severity": "reckless", "confidence": 0.61, "peak_motion": 0.70},
+        location={"in_penalty_box": True, "confidence": 0.93},
+        judgment=judgment,
+    )
+    assert result["foul_type"] == "tackle", "judgment foul_type must win"
+    assert result["severity"] == "excessive_force", "judgment severity must win"
+    assert result["punishment"] == "penalty kick + red card", (
+        "IFAB logic (penalty-box upgrade) must apply to the judgment values"
+    )
+    assert result["judgment_layer_used"] is True
+    assert result["judgment_layer_reasoning"] == judgment["reasoning"]
+    assert result["low_confidence_modules"] == ["foul_classifier", "severity_assessor"]
+    print(f"[judgment override in box] -> {result}")
+
+    # 8. Low overall confidence -> human review recommended.
+    result = make_ruling(
+        contact={"contact": True, "confidence": 0.55},
+        foul={"foul_type": "tackle", "confidence": 0.50},
+        severity={"severity": "careless", "confidence": 0.52, "peak_motion": 0.20},
+        location={"in_penalty_box": False, "confidence": 0.58},
+    )
+    assert result["confidence"] < HUMAN_REVIEW_THRESHOLD
+    assert result["human_review_recommended"] is True
+    assert result["low_confidence_modules"] == [
+        "contact_detector", "foul_classifier", "severity_assessor", "location_detector",
+    ]
+    print(f"[all modules uncertain] -> {result}")
+
+    # 9. Invalid judgment values go through the same validation.
+    try:
+        make_ruling(
+            contact={"contact": True, "confidence": 0.9},
+            foul={"foul_type": "tackle", "confidence": 0.9},
+            severity={"severity": "careless", "confidence": 0.9, "peak_motion": 0.1},
+            location={"in_penalty_box": False, "confidence": 0.9},
+            judgment={"foul_type": "tackle", "severity": "brutal",
+                      "reasoning": "x", "confidence": 0.9},
+        )
+        raise AssertionError("Expected ValueError for invalid judgment severity")
     except ValueError:
         pass
 

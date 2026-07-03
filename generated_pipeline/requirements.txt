@@ -10,3 +10,5 @@ opencv-python==4.11.0.86    # frame extraction + Farneback optical flow
 decord==0.6.0               # fast video loading
 numpy==1.26.4               # pinned <2 for decord binary compatibility
 Pillow==10.4.0              # image handling for CLIP preprocessing
+scenedetect==0.6.4          # PySceneDetect ContentDetector for shot_boundary_filter (has MSE fallback if absent)
+anthropic==0.115.1          # Claude API SDK for judgment_layer (claude-sonnet-5, ambiguous cases only)

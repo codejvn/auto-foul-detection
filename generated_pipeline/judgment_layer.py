@@ -43,13 +43,15 @@ Uses the official ``google-genai`` Python SDK (``from google import genai``)
 against ``gemini-2.5-flash`` with structured JSON output
 (``response_mime_type="application/json"`` + ``response_schema``), so the
 response is guaranteed to be valid JSON matching the output contract's
-shape. Requires the ``GEMINI_API_KEY`` environment variable; a clear
+shape. Requires the ``GEMINI_API_KEY`` environment variable, loaded from a
+``.env`` file via ``python-dotenv`` if not already set; a clear
 ``RuntimeError`` is raised when it is missing.
 
 Note on this machine: outbound HTTPS is TLS-intercepted, which breaks
 default certifi-based verification used by httpx (which this SDK uses
-internally). If real API calls fail with an SSL error here, call
-``truststore.inject_into_ssl()`` before constructing the client.
+internally). This module calls ``truststore.inject_into_ssl()`` at import
+time to verify against the OS trust store instead -- a no-op improvement
+on machines without interception.
 
 SWAP HOOK (model / caller)
 --------------------------
@@ -74,7 +76,21 @@ import json
 import os
 from typing import Callable
 
+import truststore
+from dotenv import load_dotenv
 from google.genai import types as genai_types
+
+# Some deployment environments (e.g. corporate TLS-intercepting proxies)
+# break the default certifi-based verification httpx/google-genai use.
+# truststore verifies against the OS trust store instead, which handles
+# locally-installed interception certs; it's a no-op improvement elsewhere.
+truststore.inject_into_ssl()
+
+# Loads GEMINI_API_KEY (and any other vars) from a .env file. Searches this
+# file's directory and its parents, so a repo-root .env is found regardless
+# of the caller's working directory. Does not override a variable already
+# set in the real environment.
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Configuration / swap hooks

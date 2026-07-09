@@ -12,3 +12,5 @@ numpy==1.26.4               # pinned <2 for decord binary compatibility
 Pillow==10.4.0              # image handling for CLIP preprocessing
 scenedetect==0.6.4          # PySceneDetect ContentDetector for shot_boundary_filter (has MSE fallback if absent)
 google-genai==2.10.0        # Gemini API SDK for judgment_layer (gemini-2.5-flash, ambiguous cases only)
+python-dotenv==1.2.1         # loads GEMINI_API_KEY from a .env file (judgment_layer)
+truststore==0.10.4          # OS trust store SSL verification for judgment_layer (fixes TLS interception)

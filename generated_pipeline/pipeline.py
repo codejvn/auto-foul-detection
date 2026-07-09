@@ -10,7 +10,7 @@ resident on the GPU at a time, bounding peak VRAM usage:
         -> make_ruling
 
 The shot boundary filter removes frames that straddle a camera cut so every
-downstream module sees a single continuous shot. The judgment layer (Claude
+downstream module sees a single continuous shot. The judgment layer (Gemini
 API) is consulted only for ambiguous cases -- when any of the four analysis
 modules reports confidence below the routing threshold (0.65); unambiguous
 cases go straight to the deterministic ruling engine.

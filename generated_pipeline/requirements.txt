@@ -14,3 +14,5 @@ scenedetect==0.6.4          # PySceneDetect ContentDetector for shot_boundary_fi
 google-genai==2.10.0        # Gemini API SDK for judgment_layer (gemini-2.5-flash, ambiguous cases only)
 python-dotenv==1.2.1         # loads GEMINI_API_KEY from a .env file (judgment_layer)
 truststore==0.10.4          # OS trust store SSL verification for judgment_layer (fixes TLS interception)
+torchvision==0.22.1         # frame resize/tensor transforms for train_foul_classifier.py
+scikit-learn==1.5.1         # per-class/macro F1 scoring for train_foul_classifier.py

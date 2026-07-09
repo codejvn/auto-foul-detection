@@ -119,15 +119,32 @@ def _normalize_frame_count(frames: list[np.ndarray], target: int = NUM_FRAMES) -
 
 
 class FoulClipDataset(Dataset):
-    """(video_path, label_index) pairs, decoded to VideoMAE-shaped tensors."""
+    """(video_path, label_index) pairs, decoded to VideoMAE-shaped tensors.
 
-    def __init__(self, examples: list[tuple[str, int]]):
+    `image_mean`/`image_std` should come from the same
+    `VideoMAEImageProcessor` used by `build_model()` (see
+    `VideoMAEImageProcessor.image_mean`/`.image_std`), so that pixel values
+    fed to the encoder are normalized the same way the pretrained checkpoint
+    expects. Defaults to VideoMAE's standard ImageNet mean/std if not given,
+    but callers that already have the processor loaded should always pass
+    its values explicitly.
+    """
+
+    def __init__(
+        self,
+        examples: list[tuple[str, int]],
+        image_mean: Optional[list[float]] = None,
+        image_std: Optional[list[float]] = None,
+    ):
         self.examples = examples
+        mean = image_mean if image_mean is not None else [0.5, 0.5, 0.5]
+        std = image_std if image_std is not None else [0.5, 0.5, 0.5]
         self._transform = transforms.Compose(
             [
                 transforms.ToPILImage(),
                 transforms.Resize((IMG_SIZE, IMG_SIZE)),
                 transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std),
             ]
         )
 
@@ -362,23 +379,23 @@ def run_training(dataset_path: Path, output_dir: Path) -> None:
             "Consider using a larger dataset."
         )
 
+    model, processor = build_model()
+    model.to(device)
+
     train_loader = DataLoader(
-        FoulClipDataset(train_examples),
+        FoulClipDataset(train_examples, image_mean=processor.image_mean, image_std=processor.image_std),
         batch_size=4,
         shuffle=True,
         num_workers=2,
         pin_memory=torch.cuda.is_available(),
     )
     val_loader = DataLoader(
-        FoulClipDataset(val_examples),
+        FoulClipDataset(val_examples, image_mean=processor.image_mean, image_std=processor.image_std),
         batch_size=4,
         shuffle=False,
         num_workers=2,
         pin_memory=torch.cuda.is_available(),
     )
-
-    model, _processor = build_model()
-    model.to(device)
 
     best_macro_f1 = float("-inf")
 

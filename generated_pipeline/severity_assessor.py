@@ -21,6 +21,8 @@ Public API:
 
 from __future__ import annotations
 
+import sys
+
 import cv2
 import numpy as np
 
@@ -261,6 +263,19 @@ def assess_severity(frames: list[np.ndarray], foul_type: str) -> dict:
             f"{sorted(VALID_FOUL_TYPES)}"
         )
 
+    if len(frames) < 4:
+        print(
+            f"[severity_assessor] Warning: {len(frames)} frames passed in, "
+            f"optical flow requires at least 4 frames for reliable signal. "
+            f"Returning low-confidence default.",
+            file=sys.stderr,
+        )
+        return {
+            "severity": SEVERITY_CARELESS,
+            "confidence": 0.3,
+            "peak_motion": 0.0,
+        }
+
     valid_frame_count = sum(
         1 for frame in frames if _to_grayscale_downscaled(frame) is not None
     )
@@ -410,14 +425,14 @@ if __name__ == "__main__":
     assert handball_result["severity"] in {SEVERITY_CARELESS, SEVERITY_RECKLESS}
     print("OK: handball capped at reckless.\n")
 
-    print("=== Edge case: fewer than 2 valid frames ===")
+    print("=== Edge case: fewer than 4 input frames ===")
     edge_result = assess_severity([tackle_frames[0], None], foul_type="push")
     print(edge_result)
     assert edge_result == {
         "severity": SEVERITY_CARELESS,
-        "confidence": 0.5,
+        "confidence": 0.3,
         "peak_motion": 0.0,
     }
-    print("OK: edge case handled.\n")
+    print("OK: edge case (< 4 frames) handled with low-confidence default.\n")
 
     print("All smoke tests passed.")

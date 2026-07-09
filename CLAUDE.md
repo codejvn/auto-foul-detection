@@ -27,7 +27,7 @@ pipeline.py             → orchestrates all modules, CLI entry point
 ## What we are adding (do not touch existing files unless instructed)
 ```
 shot_boundary_filter.py → PySceneDetect, removes camera cuts before analysis
-judgment_layer.py       → Fable 5 API call for ambiguous cases only
+judgment_layer.py       → Gemini API call for ambiguous cases only
                           (cases where any module confidence < 0.65)
 ruling_engine.py        → MODIFY: add confidence routing and human_review flag
 pipeline.py             → MODIFY: insert shot_boundary_filter after extract_frames,
@@ -63,11 +63,11 @@ make_ruling(contact, foul, severity, location, judgment=None) -> ruling dict
 
 ## Confidence routing logic
 - Any module confidence < 0.65 → flag that module in low_confidence_modules
-- If ANY module confidence < 0.65 → call judgment_layer (Fable 5)
+- If ANY module confidence < 0.65 → call judgment_layer (Gemini)
 - If ALL module confidences >= 0.65 → skip judgment_layer, use ruling_engine directly
 - human_review_recommended = overall confidence < 0.60
 
-## Judgment layer (Fable 5) contract
+## Judgment layer (Gemini) contract
 Input: structured dict with all module outputs + their confidences + foul type context
 Output: {"foul_type": str, "severity": str, "reasoning": str, "confidence": float}
 The judgment layer can OVERRIDE foul_classifier and severity_assessor outputs.
@@ -93,7 +93,7 @@ python judgment_layer.py
 - openai/clip-vit-base-patch32 (contact_detector, location_detector)
 - MCG-NJU/videomae-base-finetuned-kinetics (foul_classifier)
 - Farneback optical flow via OpenCV (severity_assessor)
-- claude-fable-5 via API (judgment_layer — ambiguous cases only)
+- Gemini via API (judgment_layer — ambiguous cases only)
 
 ## GPU memory
 ~4.5 GB baseline. Shot boundary filter adds ~0.2 GB peak. Judgment layer is API-only.

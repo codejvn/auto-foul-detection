@@ -51,7 +51,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import f1_score
+from sklearn.metrics import accuracy_score, f1_score
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from transformers import VideoMAEForVideoClassification, VideoMAEImageProcessor
@@ -367,7 +367,7 @@ def _forward_loss(
 
 
 def evaluate(model: DualHeadVideoMAE, loader: DataLoader, device: torch.device) -> dict:
-    """Run validation; return per-head predictions/labels/F1 stats."""
+    """Run validation; return per-head predictions/labels/F1/accuracy stats."""
     model.eval()
     action_preds: list[int] = []
     action_labels: list[int] = []
@@ -411,26 +411,54 @@ def evaluate(model: DualHeadVideoMAE, loader: DataLoader, device: torch.device) 
         )
     )
 
+    # Overall accuracy, per head. Unlike macro F1, accuracy has no per-class
+    # averaging step for an unsupported class to spuriously drag down -- it's
+    # just (# correct) / (# total) over whatever labels actually occur in
+    # this split. So, deliberately asymmetric with the macro-F1 calls above:
+    # action accuracy is NOT restricted to labels 0-7. Restricting it would
+    # be pointless (index 8 never appears in action_labels or action_preds
+    # bounded by the head's own argmax over 9 classes, so it can only ever
+    # appear as a genuinely wrong prediction, which accuracy should count) --
+    # do not "fix" this to mirror the F1 restriction.
+    action_accuracy = float(accuracy_score(action_labels, action_preds))
+    severity_accuracy = float(accuracy_score(severity_labels, severity_preds))
+
     return {
         "action_per_class_f1": action_per_class_f1,
         "action_macro_f1": action_macro_f1,
+        "action_accuracy": action_accuracy,
         "severity_per_class_f1": severity_per_class_f1,
         "severity_macro_f1": severity_macro_f1,
+        "severity_accuracy": severity_accuracy,
     }
 
 
-def _print_f1(stage: str, epoch: int, metrics: dict) -> None:
-    print(f"[{stage}] epoch {epoch} validation F1:")
+def _print_metrics(stage: str, epoch: int, metrics: dict) -> None:
+    """Print per-class F1, macro F1, and overall accuracy for both heads.
+
+    Accuracy is a diagnostic, not a selection criterion (checkpointing is
+    still driven solely by the average of the two macro F1s -- see
+    train_stage). On data this skewed, plain accuracy is dominated by the
+    majority classes within each head (e.g. action accuracy leans heavily on
+    Standing tackling at 44.8% of train rows, severity accuracy on
+    "Offence + No card" at 56.2%), so a high accuracy number alongside a
+    mediocre macro F1 does not mean the model is doing well on the rare
+    classes -- it means the majority class is easy. Reported for visibility,
+    not used to pick a checkpoint.
+    """
+    print(f"[{stage}] epoch {epoch} validation metrics:")
     print("  action head:")
     # Only classes 0-7 have per-class scores (see the macro-F1 comment in
     # evaluate()); index 8 ('none') is reserved and never scored.
     for name, score in zip(ACTION_CLASSES[:8], metrics["action_per_class_f1"]):
         print(f"    {name:<18} F1={score:.4f}")
     print(f"    {'macro (0-7)':<18} F1={metrics['action_macro_f1']:.4f}")
+    print(f"    {'accuracy':<18} acc={metrics['action_accuracy']:.4f}")
     print("  severity head:")
     for name, score in zip(OFFENCE_SEVERITY_CLASSES, metrics["severity_per_class_f1"]):
         print(f"    {name:<24} F1={score:.4f}")
     print(f"    {'macro':<24} F1={metrics['severity_macro_f1']:.4f}")
+    print(f"    {'accuracy':<24} acc={metrics['severity_accuracy']:.4f}")
 
 
 def save_checkpoint(
@@ -440,6 +468,8 @@ def save_checkpoint(
     action_macro_f1: float,
     severity_macro_f1: float,
     combined_macro_f1: float,
+    action_accuracy: float,
+    severity_accuracy: float,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_dir / "videomae-foul-best.pt"
@@ -452,6 +482,12 @@ def save_checkpoint(
             "action_macro_f1": action_macro_f1,
             "severity_macro_f1": severity_macro_f1,
             "combined_macro_f1": combined_macro_f1,
+            # Diagnostic only -- selection is driven entirely by
+            # combined_macro_f1 (see train_stage); these are saved alongside
+            # for visibility into the checkpoint that was picked, not used to
+            # pick it.
+            "action_accuracy": action_accuracy,
+            "severity_accuracy": severity_accuracy,
         },
         checkpoint_path,
     )
@@ -495,8 +531,11 @@ def train_stage(
         scheduler.step()
 
         metrics = evaluate(model, val_loader, device)
-        _print_f1(stage_name, global_epoch, metrics)
+        _print_metrics(stage_name, global_epoch, metrics)
 
+        # Checkpoint selection is driven ONLY by the average of the two
+        # macro F1s -- never by accuracy (see the diagnostic-only comment in
+        # _print_metrics / save_checkpoint).
         combined_f1 = (metrics["action_macro_f1"] + metrics["severity_macro_f1"]) / 2
         print(f"    combined (avg of both macro F1) = {combined_f1:.4f}")
 
@@ -509,6 +548,8 @@ def train_stage(
                 metrics["action_macro_f1"],
                 metrics["severity_macro_f1"],
                 combined_f1,
+                metrics["action_accuracy"],
+                metrics["severity_accuracy"],
             )
             print(f"    New best combined macro F1={combined_f1:.4f} -- saved checkpoint to {checkpoint_path}")
 

@@ -54,7 +54,7 @@ import torch.nn.functional as F
 from sklearn.metrics import f1_score
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from transformers import VideoMAEImageProcessor, VideoMAEModel
+from transformers import VideoMAEForVideoClassification, VideoMAEImageProcessor
 
 # Sibling modules live alongside this file; make imports work from anywhere
 # (mirrors the sys.path setup in validator.py).
@@ -100,11 +100,12 @@ To use this checkpoint in the pipeline, edit generated_pipeline/foul_classifier.
      'offence_severity_classes', 'epoch', 'action_macro_f1', 'severity_macro_f1',
      'combined_macro_f1'.
   2. Before loading model_state_dict, reconstruct the dual-head architecture:
-     a VideoMAEModel backbone plus two torch.nn.Linear heads --
-     torch.nn.Linear(768, len(action_classes)) (9-way action head) and
-     torch.nn.Linear(768, len(offence_severity_classes)) (4-way offence+severity
-     head), where 768 = VideoMAE-base hidden size (see DualHeadVideoMAE in this
-     file). This must match the shapes train_foul_classifier.py trained.
+     a VideoMAEModel backbone, its pretrained fc_norm LayerNorm(768), and two
+     torch.nn.Linear heads -- torch.nn.Linear(768, len(action_classes)) (9-way
+     action head) and torch.nn.Linear(768, len(offence_severity_classes))
+     (4-way offence+severity head), where 768 = VideoMAE-base hidden size (see
+     DualHeadVideoMAE in this file). This must match the shapes
+     train_foul_classifier.py trained.
   3. Use the checkpoint's 'action_classes' list (VARS order: Tackling,
      Standing tackling, High leg, Holding, Pushing, Elbowing, Challenge, Dive,
      none [reserved, index 8]) to map the action head's argmax output index to
@@ -213,35 +214,62 @@ def _validate_labels(examples: list[dict], split_name: str) -> None:
 class DualHeadVideoMAE(torch.nn.Module):
     """Shared VideoMAE backbone with two independent linear heads.
 
-    Uses `VideoMAEModel` (the bare backbone, not
-    `VideoMAEForVideoClassification`) and replicates the pooling
-    `VideoMAEForVideoClassification.forward` applies before its own
-    classifier: mean the encoder's `last_hidden_state` over the sequence
-    dimension (dim 1), then feed that pooled vector to the head(s). Confirmed
-    against the installed transformers source
-    (`transformers.models.videomae.modeling_videomae`), not assumed.
+    Replicates the pooling `VideoMAEForVideoClassification.forward` applies
+    before its own classifier, verified against the installed transformers
+    source (`transformers.models.videomae.modeling_videomae`), not assumed:
 
-    Note: `VideoMAEForVideoClassification` additionally applies an `fc_norm`
-    LayerNorm to the pooled vector before its classifier when
-    `config.use_mean_pooling` is True (true for this checkpoint). That
-    LayerNorm's pretrained weights live outside `VideoMAEModel`'s own
-    state dict (they're discarded when loading `VideoMAEModel.from_pretrained`
-    on a `...ForVideoClassification` checkpoint -- confirmed via the load
-    report, which lists `fc_norm.weight`/`fc_norm.bias` as UNEXPECTED keys),
-    so this wrapper intentionally omits it: both heads are freshly
-    initialized regardless, and there is no pretrained fc_norm to preserve.
+        outputs = self.videomae(pixel_values, **kwargs)
+        sequence_output = outputs.last_hidden_state
+        if self.fc_norm is not None:          # true when config.use_mean_pooling
+            output = sequence_output.mean(1)
+            output = self.fc_norm(output)
+        else:
+            output = sequence_output[:, 0]
+
+    `MCG-NJU/videomae-base-finetuned-kinetics`'s config has
+    `use_mean_pooling=True` (confirmed via
+    `VideoMAEConfig.from_pretrained(MODEL_ID).use_mean_pooling`), so the real
+    pooling is mean-over-dim-1 THEN an `fc_norm` LayerNorm -- not mean alone.
+
+    Loading the bare `VideoMAEModel` directly (an earlier version of this
+    wrapper did this) silently drops `fc_norm`: the checkpoint's
+    `fc_norm.weight`/`fc_norm.bias` keys report as UNEXPECTED because
+    `VideoMAEModel` has no `fc_norm` attribute to receive them, and the two
+    fresh heads would then see an unnormalized pooled vector at a different
+    scale than the pretrained model ever produced. To preserve the *trained*
+    fc_norm, load the full `VideoMAEForVideoClassification` checkpoint and
+    keep its `.videomae` (backbone) and `.fc_norm` submodules, discarding
+    only `.classifier` (which is task-specific to Kinetics-400 and being
+    replaced by our two heads anyway). Confirmed empirically that this
+    checkpoint's `fc_norm` is genuinely trained, not default LayerNorm init
+    (weight=1, bias=0): loaded `fc_norm.weight` has mean/std
+    0.6832/0.0829 (min 0.0808, max 0.8438) and `fc_norm.bias` has mean/std
+    0.0083/0.0660 (min -0.8345, max 0.3442) -- see task-1-report.md for the
+    verification script and full output.
     """
 
     def __init__(self, model_id: str = MODEL_ID):
         super().__init__()
-        self.videomae = VideoMAEModel.from_pretrained(model_id)
+        full_model = VideoMAEForVideoClassification.from_pretrained(model_id)
+        self.videomae = full_model.videomae
+        self.fc_norm = full_model.fc_norm  # pretrained LayerNorm; None if
+        # config.use_mean_pooling is False for some other checkpoint -- see
+        # the fallback in forward() below.
+        del full_model.classifier  # Kinetics-400-specific; not reused.
         hidden_size = self.videomae.config.hidden_size
         self.action_head = torch.nn.Linear(hidden_size, len(ACTION_CLASSES))
         self.severity_head = torch.nn.Linear(hidden_size, len(OFFENCE_SEVERITY_CLASSES))
 
     def forward(self, pixel_values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         outputs = self.videomae(pixel_values=pixel_values)
-        pooled = outputs.last_hidden_state.mean(dim=1)
+        sequence_output = outputs.last_hidden_state
+        if self.fc_norm is not None:
+            pooled = self.fc_norm(sequence_output.mean(dim=1))
+        else:
+            # Matches VideoMAEForVideoClassification's non-mean-pooling
+            # fallback (config.use_mean_pooling=False): use the first token
+            # instead of a mean-pooled+normalized vector.
+            pooled = sequence_output[:, 0]
         action_logits = self.action_head(pooled)
         severity_logits = self.severity_head(pooled)
         return action_logits, severity_logits
@@ -262,9 +290,19 @@ def build_model() -> tuple[DualHeadVideoMAE, VideoMAEImageProcessor]:
     processor = VideoMAEImageProcessor.from_pretrained(MODEL_ID)
     model = DualHeadVideoMAE(MODEL_ID)
 
-    # Freeze the entire backbone (all VideoMAE encoder/embedding params).
+    # Freeze the entire backbone (all VideoMAE encoder/embedding params) AND
+    # the pretrained fc_norm LayerNorm -- fc_norm is a trained part of the
+    # backbone's pooling path (see DualHeadVideoMAE docstring), not a fresh
+    # head, so it belongs in the same frozen group as the encoder. This is a
+    # deliberate choice: unfreeze_last_blocks only ever unfreezes the last N
+    # *transformer encoder* blocks in stage 2 (mirroring the pre-dual-head
+    # script's behavior, where fc_norm was likewise never unfrozen), so
+    # fc_norm stays frozen through BOTH stages unless that is revisited later.
     for param in model.videomae.parameters():
         param.requires_grad = False
+    if model.fc_norm is not None:
+        for param in model.fc_norm.parameters():
+            param.requires_grad = False
 
     # Both fresh heads start trainable.
     for param in model.action_head.parameters():

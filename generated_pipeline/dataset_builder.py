@@ -114,8 +114,12 @@ def compute_class_weights(counts: Sequence[int], num_classes: int) -> list[float
 
     ``num_classes`` should be the number of classes that actually appear (i.e.
     it should NOT count reserved, zero-count classes) -- with that convention,
-    the weights of the present classes average to 1.0, which keeps the overall
-    loss scale comparable to unweighted cross-entropy.
+    the COUNT-WEIGHTED mean of the weights is 1.0: ``sum(weight_i * count_i for
+    all i) / total == 1.0``. (The plain, unweighted arithmetic mean of the
+    weight values is NOT 1.0 -- rare classes get large weights that pull it up.)
+    The count-weighted identity is what matters: it means
+    ``CrossEntropyLoss(weight=...)`` on the real, imbalanced batch distribution
+    keeps the same overall loss scale as unweighted cross-entropy would.
 
     A ``count_i`` of 0 (e.g. the reserved 'none' action index, which is never
     produced by any real row -- see ``NONE_ACTION_INDEX``) would divide by zero
@@ -401,10 +405,26 @@ def main() -> int:
 
     # index 8 ('none') must never be produced -- a no-offence action keeps its
     # real action class label (see change #2 in task-1-brief.md). A regression
-    # here must fail loudly, not scroll past in printed output.
-    assert all(e["action_class_label"] != NONE_ACTION_INDEX for e in train_examples), (
-        "action_class_label == 8 ('none') was assigned to a real row -- "
-        "index 8 is reserved and must stay unused."
+    # here must fail loudly and visibly: an explicit check (not a bare `assert`,
+    # which `python -O` strips out entirely) that always prints its result, pass
+    # or fail, rather than relying on the absence of a traceback.
+    label_8_action_ids = [
+        e["action_id"] for e in train_examples if e["action_class_label"] == NONE_ACTION_INDEX
+    ]
+    if label_8_action_ids:
+        print(
+            f"no-label-8 assertion: FAIL "
+            f"({len(label_8_action_ids)} rows with action_class_label == 8 / "
+            f"{len(train_examples)})"
+        )
+        raise RuntimeError(
+            "action_class_label == 8 ('none') was assigned to real row(s) -- "
+            "index 8 is reserved and must stay unused. Offending action_ids: "
+            f"{label_8_action_ids}"
+        )
+    print(
+        f"no-label-8 assertion: PASS "
+        f"(0 rows with action_class_label == 8 / {len(train_examples)})"
     )
 
     action_counts = Counter(e["action_class_label"] for e in train_examples)

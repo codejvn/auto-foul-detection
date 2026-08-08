@@ -82,6 +82,12 @@ LOW_CONFIDENCE_THRESHOLD = 0.65
 #: review (`human_review_recommended` = True).
 HUMAN_REVIEW_THRESHOLD = 0.60
 
+#: The fine-tuned severity head's "no offence" label (OFFENCE_SEVERITY_CLASSES[0] in
+#: dataset_builder / foul_classifier). When the foul dict carries this severity-head
+#: signal, foul_detected is driven by "is this an offence?" from that trained head
+#: rather than the (unreliable) zero-shot CLIP contact gate.
+SEVERITY_HEAD_NO_OFFENCE = "No offence"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -230,8 +236,16 @@ def make_ruling(
     to those values are exactly the same.
 
     Rules applied:
-        - A foul is detected only if foul_type != 'none' AND
-          (contact['contact'] is True OR foul_type is in
+        - Foul detection follows three branches, in priority order: (a) when
+          a judgment layer verdict is provided, foul_detected is simply
+          judgment['foul_type'] != 'none'; (b) otherwise, when `foul` carries
+          the fine-tuned severity head's signal (a 'severity' key), a foul is
+          detected when that head predicts an offence (severity != 'No
+          offence') AND foul_type != 'none' -- this trained signal is far
+          more reliable on soccer-foul clips than the zero-shot CLIP contact
+          detector; (c) otherwise (legacy foul dicts without the severity-head
+          signal), the original contact-gated rule applies: foul_type !=
+          'none' AND (contact['contact'] is True OR foul_type is in
           {'handball', 'simulation'}), since handballs and simulation do
           not require player-to-player contact.
         - Punishment is looked up from PUNISHMENT_TABLE by severity.
@@ -299,12 +313,27 @@ def make_ruling(
     _validate_foul_type(foul_type)
     _validate_severity(severity_level)
 
-    has_contact = bool(contact["contact"])
     in_penalty_box = bool(location["in_penalty_box"])
 
-    foul_detected = (foul_type != "none") and (
-        has_contact or foul_type in CONTACT_EXEMPT_FOUL_TYPES
-    )
+    if judgment is not None:
+        # The judgment layer is the resolver for ambiguous cases; trust its
+        # foul_type assertion directly for detection.
+        foul_detected = foul_type != "none"
+    elif "severity" in foul and foul.get("severity") is not None:
+        # Preferred path: the fine-tuned severity head predicts offence vs
+        # "No offence" directly. It is far more reliable on soccer-foul clips
+        # than the zero-shot CLIP contact detector, which systematically
+        # under-detects contact. A foul is detected when the severity head
+        # predicts an offence AND the action head predicts a real foul type.
+        foul_detected = (foul["severity"] != SEVERITY_HEAD_NO_OFFENCE) and (foul_type != "none")
+    else:
+        # Legacy fallback for foul dicts WITHOUT the dual-head severity signal
+        # (e.g. this module's own smoke test, or any caller passing the old
+        # {foul_type, confidence} shape): the original contact-gated IFAB rule.
+        has_contact = bool(contact["contact"])
+        foul_detected = (foul_type != "none") and (
+            has_contact or foul_type in CONTACT_EXEMPT_FOUL_TYPES
+        )
 
     if not foul_detected:
         ruling_foul_type = "none"
@@ -496,5 +525,52 @@ if __name__ == "__main__":
         raise AssertionError("Expected ValueError for invalid judgment severity")
     except ValueError:
         pass
+
+    # ------------------------------------------------------------------
+    # Severity-head-driven detection (dual-head foul_classifier output)
+    # ------------------------------------------------------------------
+
+    # 10. Severity head says offence, contact detector says False -> the
+    #     offence signal from the trained severity head overrides the
+    #     absent/unreliable contact gate. foul_detected must be True.
+    result = make_ruling(
+        contact={"contact": False, "confidence": 0.30},
+        foul={"foul_type": "tackle", "confidence": 0.85, "severity": "Offence + No card"},
+        severity={"severity": "careless", "confidence": 0.80, "peak_motion": 0.40},
+        location={"in_penalty_box": False, "confidence": 0.90},
+    )
+    assert result["foul_detected"] is True, (
+        "severity head 'Offence + No card' must drive foul_detected True "
+        "even with contact=False"
+    )
+    print(f"[severity-head offence, no contact] -> {result}")
+
+    # 11. Severity head says no offence, contact detector says True -> the
+    #     trained head's 'no offence' verdict overrides contact=True.
+    #     foul_detected must be False and punishment must be PLAY_ON.
+    result = make_ruling(
+        contact={"contact": True, "confidence": 0.90},
+        foul={"foul_type": "tackle", "confidence": 0.85, "severity": "No offence"},
+        severity={"severity": "careless", "confidence": 0.80, "peak_motion": 0.10},
+        location={"in_penalty_box": False, "confidence": 0.90},
+    )
+    assert result["foul_detected"] is False, (
+        "severity head 'No offence' must drive foul_detected False "
+        "even with contact=True"
+    )
+    assert result["punishment"] == PLAY_ON
+    print(f"[severity-head no offence, contact True] -> {result}")
+
+    # 12. Severity head says offence (red card), in the penalty box ->
+    #     penalty kick + red card, foul_detected True.
+    result = make_ruling(
+        contact={"contact": True, "confidence": 0.90},
+        foul={"foul_type": "tackle", "confidence": 0.88, "severity": "Offence + Red card"},
+        severity={"severity": "excessive_force", "confidence": 0.85, "peak_motion": 0.95},
+        location={"in_penalty_box": True, "confidence": 0.92},
+    )
+    assert result["foul_detected"] is True
+    assert result["punishment"] == "penalty kick + red card"
+    print(f"[severity-head offence red card, in box] -> {result}")
 
     print("\nAll smoke tests passed.")

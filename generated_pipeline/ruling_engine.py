@@ -88,6 +88,17 @@ HUMAN_REVIEW_THRESHOLD = 0.60
 #: rather than the (unreliable) zero-shot CLIP contact gate.
 SEVERITY_HEAD_NO_OFFENCE = "No offence"
 
+#: Maps the fine-tuned severity head's card-decision labels
+#: (OFFENCE_SEVERITY_CLASSES[1..3] from dataset_builder / foul_classifier) onto the ruling
+#: engine's internal careless/reckless/excessive_force severity vocab (PUNISHMENT_TABLE keys).
+#: The trained head replaces the optical-flow severity_assessor for the punishment decision;
+#: severity_assessor was measured to predict "excessive_force" on ~98% of detected clips.
+SEVERITY_HEAD_TO_SEVERITY = {
+    "Offence + No card": "careless",
+    "Offence + Yellow card": "reckless",
+    "Offence + Red card": "excessive_force",
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -248,6 +259,14 @@ def make_ruling(
           'none' AND (contact['contact'] is True OR foul_type is in
           {'handball', 'simulation'}), since handballs and simulation do
           not require player-to-player contact.
+        - Severity (absent a judgment override) prefers the fine-tuned severity
+          head's card decision: when `foul` carries a 'severity' key that is one
+          of SEVERITY_HEAD_TO_SEVERITY's keys ('Offence + No card' / 'Offence +
+          Yellow card' / 'Offence + Red card'), it is mapped via that table to
+          the internal careless/reckless/excessive_force vocab and used as
+          severity_level. Otherwise (legacy foul dicts without the severity-head
+          signal), severity_level falls back to `severity['severity']` from the
+          optical-flow severity_assessor.
         - Punishment is looked up from PUNISHMENT_TABLE by severity.
         - Simulation always yields 'free kick + yellow card (simulation)'
           and is never upgraded to a penalty kick.
@@ -308,7 +327,14 @@ def make_ruling(
         severity_level = judgment["severity"]
     else:
         foul_type = foul["foul_type"]
-        severity_level = severity["severity"]
+        # Prefer the trained severity head's card decision (mapped to the internal
+        # careless/reckless/excessive_force vocab) over the optical-flow severity_assessor,
+        # which was measured badly miscalibrated (excessive_force on ~98% of detected clips).
+        # Fall back to severity_assessor for legacy foul dicts without the severity-head signal.
+        if foul.get("severity") in SEVERITY_HEAD_TO_SEVERITY:
+            severity_level = SEVERITY_HEAD_TO_SEVERITY[foul["severity"]]
+        else:
+            severity_level = severity["severity"]
 
     _validate_foul_type(foul_type)
     _validate_severity(severity_level)
@@ -572,5 +598,62 @@ if __name__ == "__main__":
     assert result["foul_detected"] is True
     assert result["punishment"] == "penalty kick + red card"
     print(f"[severity-head offence red card, in box] -> {result}")
+
+    # ------------------------------------------------------------------
+    # Severity-head-driven punishment (severity head wins over severity_assessor)
+    # ------------------------------------------------------------------
+
+    # 13. Severity head says "Offence + Yellow card" -> mapped to "reckless",
+    #     which wins over the severity_assessor param's "careless".
+    result = make_ruling(
+        contact={"contact": True, "confidence": 0.90},
+        foul={"foul_type": "tackle", "confidence": 0.5, "severity": "Offence + Yellow card"},
+        severity={"severity": "careless", "confidence": 0.80, "peak_motion": 0.40},
+        location={"in_penalty_box": False, "confidence": 0.90},
+    )
+    assert result["severity"] == "reckless", (
+        "severity head 'Offence + Yellow card' must map to 'reckless', "
+        "overriding the severity_assessor param"
+    )
+    assert result["punishment"] == "free kick + yellow card"
+    print(f"[severity-head yellow card wins over assessor] -> {result}")
+
+    # 14. Severity head says "Offence + Red card", in the penalty box ->
+    #     penalty kick + red card.
+    result = make_ruling(
+        contact={"contact": True, "confidence": 0.90},
+        foul={"foul_type": "tackle", "confidence": 0.5, "severity": "Offence + Red card"},
+        severity={"severity": "careless", "confidence": 0.80, "peak_motion": 0.40},
+        location={"in_penalty_box": True, "confidence": 0.90},
+    )
+    assert result["severity"] == "excessive_force"
+    assert result["punishment"] == "penalty kick + red card"
+    print(f"[severity-head red card in box] -> {result}")
+
+    # 15. Severity head says "Offence + No card" -> mapped to "careless",
+    #     free kick.
+    result = make_ruling(
+        contact={"contact": True, "confidence": 0.90},
+        foul={"foul_type": "tackle", "confidence": 0.5, "severity": "Offence + No card"},
+        severity={"severity": "reckless", "confidence": 0.80, "peak_motion": 0.40},
+        location={"in_penalty_box": False, "confidence": 0.90},
+    )
+    assert result["severity"] == "careless"
+    assert result["punishment"] == "free kick"
+    print(f"[severity-head no card] -> {result}")
+
+    # 16. Legacy foul dict WITHOUT "severity" key -> still uses the
+    #     severity_assessor param (unchanged behavior).
+    result = make_ruling(
+        contact={"contact": True, "confidence": 0.90},
+        foul={"foul_type": "tackle", "confidence": 0.85},
+        severity={"severity": "excessive_force", "confidence": 0.80, "peak_motion": 0.95},
+        location={"in_penalty_box": False, "confidence": 0.90},
+    )
+    assert result["severity"] == "excessive_force", (
+        "legacy foul dict without 'severity' key must fall back to severity_assessor"
+    )
+    assert result["punishment"] == "free kick + red card"
+    print(f"[legacy foul dict, no severity-head key] -> {result}")
 
     print("\nAll smoke tests passed.")

@@ -48,9 +48,16 @@ Usage
 -----
     python validator.py --dataset-path ./mvfoul_dataset --output results.json
     python validator.py --smoke-test
+    python validator.py --dataset-path ./mvfoul_dataset --with-judgment-layer
 
 The pipeline (and its GPU models) is imported lazily, so --smoke-test runs
 with no dataset, no models, and no API key.
+
+By default, ``evaluate_dataset`` runs each clip with the Gemini judgment
+layer DISABLED (``use_judgment_layer=False``): a calibration sweep measures
+the CV pipeline's OWN confidence, not the judgment layer's, and skipping it
+avoids spending Gemini API credits across the full dataset. Pass
+``--with-judgment-layer`` to opt back in for a small spot-check subset.
 """
 
 from __future__ import annotations
@@ -196,6 +203,72 @@ def build_ground_truth(labels: list[dict]) -> dict:
         "human_disagreement": disagreement,
         "num_annotators": len(labels),
     }
+
+
+# ---------------------------------------------------------------------------
+# MVFoul split discovery (via dataset_builder)
+# ---------------------------------------------------------------------------
+
+
+def _mvfoul_records_from_split(annotations_path: Path) -> list[dict]:
+    """Return [{clip_id, video_path, ground_truth}] for an MVFoul split.
+
+    Uses ``dataset_builder.build_dataset`` to enumerate clips + ground truth
+    directly from a split-level ``annotations.json`` (MVFoul "Actions"
+    format), bypassing ``discover_clips``'s per-clip-dir layout assumption.
+
+    Clear examples (resolvable offence/severity) are the non-disagreement
+    set; hard_cases (borderline/empty severity -- annotators wouldn't
+    commit) are treated as the human-disagreement set for calibration, with
+    severity left unscored (``None``).
+
+    Args:
+        annotations_path: Path to a split's ``annotations.json``.
+
+    Returns:
+        List of dicts with keys 'clip_id', 'video_path' (str), and
+        'ground_truth' (dict shaped like ``build_ground_truth``'s output).
+    """
+    from dataset_builder import ACTION_CLASSES, OFFENCE_SEVERITY_CLASSES, build_dataset
+
+    clear, hard = build_dataset(annotations_path)
+    records: list[dict] = []
+
+    for ex in clear:
+        osc = ex["offence_severity_class"]
+        offence = osc != 0
+        records.append(
+            {
+                "clip_id": f"action_{ex['action_id']}",
+                "video_path": ex["video_path"],
+                "ground_truth": {
+                    "offence": offence,
+                    "foul_type": normalize_foul_type(ACTION_CLASSES[ex["action_class_label"]]),
+                    "severity": (
+                        normalize_severity(OFFENCE_SEVERITY_CLASSES[osc]) if offence else None
+                    ),
+                    "human_disagreement": False,
+                    "num_annotators": 1,
+                },
+            }
+        )
+
+    for ex in hard:
+        records.append(
+            {
+                "clip_id": f"action_{ex['action_id']}#hard",
+                "video_path": ex["video_path"],
+                "ground_truth": {
+                    "offence": True,
+                    "foul_type": normalize_foul_type(ACTION_CLASSES[ex["action_class_label"]]),
+                    "severity": None,
+                    "human_disagreement": True,
+                    "num_annotators": 1,
+                },
+            }
+        )
+
+    return records
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +498,7 @@ def print_summary(results: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def evaluate_dataset(dataset_path: Path) -> dict:
+def evaluate_dataset(dataset_path: Path, use_judgment_layer: bool = False) -> dict:
     """Run the full pipeline over every clip in the dataset and score it.
 
     The pipeline module (and its GPU models) is imported here, lazily, so
@@ -433,6 +506,13 @@ def evaluate_dataset(dataset_path: Path) -> dict:
 
     Args:
         dataset_path: Root directory of the dataset.
+        use_judgment_layer: Whether to enable the Gemini judgment layer for
+            ambiguous clips. Defaults to False -- a calibration sweep is
+            measuring the CV pipeline's OWN confidence, not the judgment
+            layer's, and running the full dataset through Gemini would spend
+            API credits on a run that doesn't need it. Pass True (via
+            ``--with-judgment-layer``) to opt in for a small spot-check
+            subset.
 
     Returns:
         The results dict from ``compute_metrics``.
@@ -441,29 +521,74 @@ def evaluate_dataset(dataset_path: Path) -> dict:
         FileNotFoundError: If the dataset path does not exist.
         ValueError: If no usable clips are found under it.
     """
-    clips = discover_clips(dataset_path)
-    if not clips:
+    # Auto-detect an MVFoul split: a directory with a split-level
+    # annotations.json containing an "Actions" key (dataset_builder's
+    # format), as opposed to the old <clip_dir>/annotations.json layout.
+    mvfoul_ann: Optional[Path] = None
+    if dataset_path.is_dir():
+        cand = dataset_path / "annotations.json"
+        if cand.is_file():
+            try:
+                if "Actions" in json.loads(cand.read_text(encoding="utf-8")):
+                    mvfoul_ann = cand
+            except (OSError, json.JSONDecodeError, TypeError):
+                pass
+
+    if mvfoul_ann is not None:
+        print(
+            f"[validator] MVFoul split detected: {mvfoul_ann} (via dataset_builder)",
+            file=sys.stderr,
+        )
+        records = _mvfoul_records_from_split(mvfoul_ann)
+    else:
+        records = [
+            {
+                "clip_id": clip["clip_id"],
+                "video_path": clip["video_path"],
+                "ground_truth": build_ground_truth(clip["labels"]),
+            }
+            for clip in discover_clips(dataset_path)
+        ]
+
+    if not records:
         raise ValueError(
-            f"No usable clips found under '{dataset_path}'. Expected "
+            f"No usable clips found under '{dataset_path}'. Expected either an "
+            "MVFoul split (annotations.json with an 'Actions' key) or "
             "<clip_dir>/annotations.json plus one video file per clip."
         )
+
+    hard_count = sum(1 for r in records if r["ground_truth"]["human_disagreement"])
+    print(
+        f"[validator] {len(records)} clips ({len(records) - hard_count} clear, "
+        f"{hard_count} hard/disagreement)",
+        file=sys.stderr,
+    )
 
     # Lazy import AFTER dataset discovery, so path/annotation problems
     # surface immediately instead of after minutes of model loading.
     from pipeline import run_pipeline
 
-    print(f"[validator] Evaluating {len(clips)} clips...", file=sys.stderr)
+    print(f"[validator] Evaluating {len(records)} clips...", file=sys.stderr)
+    print(
+        "[validator] judgment layer: "
+        + ("ENABLED (--with-judgment-layer)" if use_judgment_layer
+           else "DISABLED (default; each clip uses ruling_engine directly, no Gemini calls). "
+                "Pass --with-judgment-layer to enable."),
+        file=sys.stderr,
+    )
     evaluated: list[dict] = []
     failed = 0
     start = time.perf_counter()
 
-    for index, clip in enumerate(clips, start=1):
+    for index, record in enumerate(records, start=1):
         print(
-            f"[validator] ({index}/{len(clips)}) {clip['clip_id']}",
+            f"[validator] ({index}/{len(records)}) {record['clip_id']}",
             file=sys.stderr,
         )
         try:
-            ruling = run_pipeline(clip["video_path"])
+            ruling = run_pipeline(
+                record["video_path"], use_judgment_layer=use_judgment_layer
+            )
         except Exception as exc:  # noqa: BLE001 - one bad clip must not kill the run
             failed += 1
             print(
@@ -474,8 +599,8 @@ def evaluate_dataset(dataset_path: Path) -> dict:
 
         evaluated.append(
             {
-                "clip_id": clip["clip_id"],
-                "ground_truth": build_ground_truth(clip["labels"]),
+                "clip_id": record["clip_id"],
+                "ground_truth": record["ground_truth"],
                 "ruling": ruling,
             }
         )
@@ -640,6 +765,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run on 5 hardcoded fake examples; needs no dataset or models.",
     )
+    parser.add_argument(
+        "--with-judgment-layer", action="store_true",
+        help="Enable the Gemini judgment layer during evaluation (default: disabled, to avoid "
+             "spending API credits across the full sweep). Use for small spot-check subsets.",
+    )
     return parser
 
 
@@ -652,7 +782,9 @@ def main() -> None:
         results = run_smoke_test()
     elif args.dataset_path:
         try:
-            results = evaluate_dataset(Path(args.dataset_path))
+            results = evaluate_dataset(
+                Path(args.dataset_path), use_judgment_layer=args.with_judgment_layer
+            )
         except (FileNotFoundError, ValueError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)

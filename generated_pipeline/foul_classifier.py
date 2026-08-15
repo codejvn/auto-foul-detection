@@ -2,123 +2,125 @@
 foul_classifier.py
 ===================
 
-Foul-type classification module for the auto-foul-detection pipeline.
+Foul-type AND severity classification module for the auto-foul-detection
+pipeline.
 
-This module wraps a pre-trained VideoMAE video classification model
-(fine-tuned on Kinetics-400) and maps its action-recognition predictions
-onto soccer foul categories using a keyword mapping over the predicted
-label strings. It is one signal among several (CLIP contact/box-location
-heads, optical-flow severity, ruling engine) that are combined elsewhere
-in the pipeline.
+This module loads the fine-tuned `DualHeadVideoMAE` checkpoint produced by
+`train_foul_classifier.py` (VideoMAE backbone + fc_norm + a 9-way action
+head + a 4-way offence-severity head) and forwards prepared clips through
+it directly -- no keyword mapping over a generic Kinetics-400 label set is
+involved anymore. The 9-class action prediction is collapsed onto the
+original 6-term foul_type vocabulary pipeline.py's callers expect via
+ACTION_TO_FOUL_TYPE. It is one signal among several (CLIP contact/box-
+location heads, optical-flow severity, ruling engine) that are combined
+elsewhere in the pipeline.
 
 Public API
 ----------
 classify_foul(frames: list[np.ndarray]) -> dict
     frames: list of RGB uint8 HxWx3 numpy arrays (any length >= 1)
-    returns: {"foul_type": str, "confidence": float}
+    returns: {
+        "foul_type": str,               # 6-vocab, for pipeline.py callers
+        "confidence": float,            # max action-head softmax prob
+        "severity": str,                # 4-class label from the severity head
+        "severity_confidence": float,
+        "action_class_probs": dict[str, float],    # full 9-class softmax
+        "severity_class_probs": dict[str, float],  # full 4-class softmax
+    }
     where foul_type is one of: tackle, handball, obstruction, simulation,
-    push, none.
+    push, none. NOTE: "handball" is not currently reachable -- see
+    ACTION_TO_FOUL_TYPE below.
 
 Design notes
 ------------
 - VideoMAE requires exactly 16 frames per clip. Shorter sequences are
   padded by repeating the final frame; longer sequences are subsampled
   evenly across the clip.
-- The pre-trained Kinetics-400 head does NOT know about soccer fouls.
-  We take its top-5 predicted action labels and map them onto foul
-  categories via keyword matching (see KINETICS_LABEL_TO_FOUL_KEYWORDS).
-  Handball and simulation are essentially unreachable through this
-  mapping because Kinetics-400 has no closely related action classes;
-  they will only become reliably detectable after fine-tuning on
-  SoccerNet-style foul-labeled clips (see SWAP HOOK below).
-- The model and image processor are cached as module-level singletons
-  and lazily loaded on first use to avoid paying the load cost at
-  import time.
+- Preprocessing replicates `train_foul_classifier.py`'s `FoulClipDataset`
+  EXACTLY: torchvision `Resize((224, 224))` (squash, ignores aspect ratio)
+  + `ToTensor()` + `Normalize(processor.image_mean, processor.image_std)`.
+  We deliberately do NOT use `VideoMAEImageProcessor.__call__`, which does
+  shortest-edge-resize + center-crop -- a different framing that would
+  mis-feed a model trained on the squashed preprocessing above.
+- The model, processor-derived transform, device, and class-name lists are
+  cached as module-level singletons and lazily loaded on first use.
 - Uses CUDA when available, otherwise falls back to CPU automatically.
+
+REDUNDANCY NOTE (severity_assessor.py)
+---------------------------------------
+This module now emits a direct, trained severity signal (`severity` /
+`severity_class_probs`) from the checkpoint's severity_head, which makes
+`severity_assessor.py`'s Farneback optical-flow heuristic redundant as a
+severity estimator. `severity_assessor.py` is intentionally left in place
+and unwired here pending validation of the trained head's accuracy against
+the VARS dataset (see validator.py) -- this module does not import from or
+modify severity_assessor.py or pipeline.py.
 """
 
 from __future__ import annotations
 
 import logging
-import sys
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers import VideoMAEForVideoClassification, VideoMAEImageProcessor
+from torchvision import transforms
+from transformers import VideoMAEImageProcessor
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# SWAP HOOK
-# ---------------------------------------------------------------------------
-# MODEL_ID controls which checkpoint this module loads. Today it points at
-# a generic Kinetics-400 action-recognition checkpoint, whose predictions
-# are translated into foul categories via keyword matching further below.
-#
-# `train_foul_classifier.py` fine-tunes this exact checkpoint into a direct
-# 6-class head and saves it to `./checkpoints/videomae-foul-best.pt`. To
-# activate that fine-tuned checkpoint here, do EXACTLY this:
-#
-#   1. Load the checkpoint dict from './checkpoints/videomae-foul-best.pt'
-#      via `torch.load(...)`. It has keys: 'model_state_dict',
-#      'class_names', 'epoch', 'val_f1'.
-#   2. Before loading `model_state_dict`, replace the model's classification
-#      head with `torch.nn.Linear(768, len(CLASS_NAMES))` (768 = VideoMAE-
-#      base hidden size; this must match the head shape
-#      `train_foul_classifier.py` trains).
-#   3. Use the checkpoint's 'class_names' list (index order: tackle,
-#      handball, obstruction, simulation, push, none) to map the argmax
-#      output index directly to a foul type string — no keyword matching
-#      needed, e.g.:
-#          probs = F.softmax(logits, dim=-1)[0]
-#          idx = int(torch.argmax(probs).item())
-#          label = checkpoint["class_names"][idx]
-#          confidence = float(probs[idx].item())
-#          return {"foul_type": label, "confidence": confidence}
-#   4. In `classify_foul`, replace the call to `_map_kinetics_logits_to_foul`
-#      with the direct softmax + argmax over the 6-class logits shown above.
-#   5. DELETE the `_map_kinetics_logits_to_foul` function and the
-#      `KINETICS_LABEL_TO_FOUL_KEYWORDS` mapping dict entirely — they are
-#      Kinetics-400-specific compatibility shims that no longer apply once
-#      the model natively outputs foul classes.
-# ---------------------------------------------------------------------------
+# The base VideoMAE checkpoint the fine-tuned dual-head model is built on
+# (backbone architecture + image processor mean/std source).
 MODEL_ID: str = "MCG-NJU/videomae-base-finetuned-kinetics"
+
+# Fine-tuned dual-head checkpoint produced by train_foul_classifier.py.
+# Resolved relative to the repo root (parent of generated_pipeline/) so it
+# is robust to the working directory the pipeline is invoked from.
+CHECKPOINT_PATH: Path = (
+    Path(__file__).resolve().parent.parent / "checkpoints" / "videomae-foul-best.pt"
+)
 
 # Number of frames VideoMAE expects per clip.
 NUM_FRAMES: int = 16
 
-# Number of top predicted Kinetics-400 labels to inspect when mapping to
-# foul categories.
-TOP_K: int = 5
+# Square side length frames are resized to before feeding the model (must
+# match training's torchvision Resize((224, 224)) squash).
+IMG_SIZE: int = 224
 
 # The complete set of foul categories this module can emit.
 FOUL_TYPES = ("tackle", "handball", "obstruction", "simulation", "push", "none")
 
-# Keyword -> foul type mapping applied (in order) against lowercased
-# Kinetics-400 label strings. The first matching keyword for a label wins.
-# NOTE: 'handball' and 'simulation' have no reliable Kinetics-400 analogues
-# and are effectively unreachable via this mapping today; they will become
-# detectable once a SoccerNet fine-tuned head is swapped in (see SWAP HOOK).
-KINETICS_LABEL_TO_FOUL_KEYWORDS: dict[str, str] = {
-    "tackl": "tackle",
-    "wrestling": "push",
-    "push": "push",
-    "slapping": "push",
-    "punching": "push",
-    "headbutting": "push",
-    "shoving": "push",
-    "grappling": "obstruction",
-    "wrestl": "obstruction",
-    "capoeira": "obstruction",
-    "sparring": "obstruction",
+# Maps the fine-tuned 9-class action label -> the original 6-term foul_type
+# vocabulary pipeline.py's callers expect. This COLLAPSES distinctions:
+# Tackling, Standing tackling, High leg, and Challenge all -> "tackle";
+# Elbowing -> "push". NOTE: "handball" is NOT reachable from this head --
+# the action head has no handball class (handball was a separate label
+# deferred during training), so classify_foul can never return "handball"
+# now.
+ACTION_TO_FOUL_TYPE: dict[str, str] = {
+    "Tackling": "tackle",
+    "Standing tackling": "tackle",
+    "High leg": "tackle",
+    "Holding": "obstruction",
+    "Pushing": "push",
+    "Elbowing": "push",
+    "Challenge": "tackle",
+    "Dive": "simulation",
+    "none": "none",
 }
 
-# Module-level singleton cache for the model and processor.
-_model: Optional[VideoMAEForVideoClassification] = None
-_processor: Optional[VideoMAEImageProcessor] = None
+# Module-level singleton cache for the model, preprocessing transform,
+# device, and the checkpoint's class-name lists.
+_model = None
+_transform: Optional[transforms.Compose] = None
 _device: Optional[torch.device] = None
+_action_classes: Optional[list[str]] = None
+_severity_classes: Optional[list[str]] = None
+
+# Ensures the severity_assessor redundancy warning is only logged once.
+_redundancy_warning_emitted: bool = False
 
 
 def _get_device() -> torch.device:
@@ -126,28 +128,63 @@ def _get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _load_model() -> tuple[VideoMAEForVideoClassification, VideoMAEImageProcessor, torch.device]:
+def _load_model():
     """
-    Lazily load and cache the VideoMAE model and its image processor.
+    Lazily load and cache the fine-tuned DualHeadVideoMAE model, its
+    preprocessing transform, device, and class-name lists.
 
-    Returns the cached singletons on subsequent calls. Raises a
-    RuntimeError with a helpful message if the model fails to download
-    or load (e.g. due to network issues or a bad MODEL_ID).
+    Returns (model, transform, device, action_classes, severity_classes) on
+    subsequent calls from cache. Raises FileNotFoundError if the checkpoint
+    is missing, or RuntimeError if loading fails (network/cache issues or
+    an architecture/checkpoint mismatch).
     """
-    global _model, _processor, _device
+    global _model, _transform, _device, _action_classes, _severity_classes
+    global _redundancy_warning_emitted
 
-    if _model is not None and _processor is not None and _device is not None:
-        return _model, _processor, _device
+    if (
+        _model is not None
+        and _transform is not None
+        and _device is not None
+        and _action_classes is not None
+        and _severity_classes is not None
+    ):
+        return _model, _transform, _device, _action_classes, _severity_classes
+
+    # Lazy import: keeps this module's import light and reuses the exact
+    # architecture train_foul_classifier.py trained, guaranteeing
+    # load_state_dict(strict=True) succeeds.
+    from train_foul_classifier import DualHeadVideoMAE
 
     _device = _get_device()
-    logger.info("Loading VideoMAE model '%s' onto device '%s'...", MODEL_ID, _device)
+    logger.info(
+        "Loading fine-tuned DualHeadVideoMAE from '%s' onto device '%s'...",
+        CHECKPOINT_PATH,
+        _device,
+    )
+
+    if not CHECKPOINT_PATH.exists():
+        raise FileNotFoundError(
+            f"Fine-tuned checkpoint not found at '{CHECKPOINT_PATH}'. Run "
+            "train_foul_classifier.py to produce it before using "
+            "foul_classifier.classify_foul()."
+        )
 
     try:
         processor = VideoMAEImageProcessor.from_pretrained(MODEL_ID)
-        model = VideoMAEForVideoClassification.from_pretrained(MODEL_ID)
+        transform = transforms.Compose(
+            [
+                transforms.ToPILImage(),
+                transforms.Resize((IMG_SIZE, IMG_SIZE)),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=processor.image_mean, std=processor.image_std
+                ),
+            ]
+        )
+        model = DualHeadVideoMAE(MODEL_ID)
     except Exception as exc:  # noqa: BLE001 - we want to wrap any load failure
         raise RuntimeError(
-            f"Failed to load VideoMAE model/processor for MODEL_ID='{MODEL_ID}'. "
+            f"Failed to load base VideoMAE model/processor for MODEL_ID='{MODEL_ID}'. "
             "This usually means either (1) there is no internet connection to "
             "download the checkpoint from the Hugging Face Hub, (2) the "
             "'transformers' cache is corrupted, or (3) MODEL_ID is invalid. "
@@ -155,13 +192,42 @@ def _load_model() -> tuple[VideoMAEForVideoClassification, VideoMAEImageProcesso
             "to diagnose, or check your network connection."
         ) from exc
 
+    try:
+        ckpt = torch.load(CHECKPOINT_PATH, map_location="cpu", weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"], strict=True)
+    except Exception as exc:  # noqa: BLE001 - wrap architecture/checkpoint mismatches
+        raise RuntimeError(
+            f"Failed to load state dict from checkpoint '{CHECKPOINT_PATH}' into "
+            "DualHeadVideoMAE. This usually means the checkpoint was trained "
+            "with a different architecture than train_foul_classifier.py "
+            "currently defines. Re-run training to regenerate a compatible "
+            "checkpoint, or check that train_foul_classifier.py hasn't "
+            "diverged from the checkpoint's architecture."
+        ) from exc
+
     model.to(_device)
     model.eval()
 
+    action_classes = list(ckpt["action_classes"])
+    severity_classes = list(ckpt["offence_severity_classes"])
+
+    if not _redundancy_warning_emitted:
+        logger.warning(
+            "foul_classifier now emits a direct trained severity signal "
+            "(severity/severity_class_probs) from the checkpoint's "
+            "severity_head, making severity_assessor.py's Farneback "
+            "optical-flow heuristic redundant as a severity estimator. "
+            "severity_assessor.py is intentionally left in place / unwired "
+            "pending validation."
+        )
+        _redundancy_warning_emitted = True
+
     _model = model
-    _processor = processor
-    logger.info("VideoMAE model loaded successfully.")
-    return _model, _processor, _device
+    _transform = transform
+    _action_classes = action_classes
+    _severity_classes = severity_classes
+    logger.info("Fine-tuned DualHeadVideoMAE loaded successfully.")
+    return _model, _transform, _device, _action_classes, _severity_classes
 
 
 def _prepare_frames(frames: list[np.ndarray]) -> list[np.ndarray]:
@@ -207,58 +273,11 @@ def _prepare_frames(frames: list[np.ndarray]) -> list[np.ndarray]:
     return [valid_frames[i] for i in indices]
 
 
-def _map_kinetics_logits_to_foul(logits: torch.Tensor, id2label: dict[int, str]) -> dict[str, float]:
-    """
-    Map raw Kinetics-400 classification logits to a foul-type prediction.
-
-    Applies softmax, inspects the top-TOP_K predicted labels, and matches
-    each label string against KINETICS_LABEL_TO_FOUL_KEYWORDS (case
-    insensitive substring match). The foul type with the highest summed
-    probability mass among top-K predictions wins.
-
-    If no foul-mapped keyword is found among the top-K labels, the result
-    is 'none' with confidence = 1.0 minus the summed probability of all
-    foul-mapped labels found in the top-K (clamped to [0.05, 0.99]).
-
-    Returns {"foul_type": str, "confidence": float}.
-    """
-    probs = F.softmax(logits, dim=-1)[0]
-
-    debug_topk = torch.topk(probs, k=min(10, probs.shape[-1]))
-    print("[foul_classifier] top-10 Kinetics predictions:", file=sys.stderr)
-    for idx, prob in zip(debug_topk.indices.tolist(), debug_topk.values.tolist()):
-        print(f"  {prob:.3f}  {id2label.get(idx, '<unknown>')}", file=sys.stderr)
-
-    topk = torch.topk(probs, k=min(TOP_K, probs.shape[-1]))
-    top_indices = topk.indices.tolist()
-    top_probs = topk.values.tolist()
-
-    foul_type_scores: dict[str, float] = {}
-    total_foul_mass = 0.0
-
-    for idx, prob in zip(top_indices, top_probs):
-        label = id2label.get(idx, "").lower()
-        matched_type: Optional[str] = None
-        for keyword, foul_type in KINETICS_LABEL_TO_FOUL_KEYWORDS.items():
-            if keyword in label:
-                matched_type = foul_type
-                break
-        if matched_type is not None:
-            foul_type_scores[matched_type] = foul_type_scores.get(matched_type, 0.0) + prob
-            total_foul_mass += prob
-
-    if not foul_type_scores:
-        confidence = max(0.05, min(0.99, 1.0 - total_foul_mass))
-        return {"foul_type": "none", "confidence": confidence}
-
-    winning_type = max(foul_type_scores, key=foul_type_scores.get)
-    confidence = max(0.05, min(0.99, foul_type_scores[winning_type]))
-    return {"foul_type": winning_type, "confidence": confidence}
-
-
 def classify_foul(frames: list[np.ndarray]) -> dict:
     """
-    Classify the type of foul depicted in a short clip of RGB frames.
+    Classify the foul type AND severity depicted in a short clip of RGB
+    frames, via a direct forward pass through the fine-tuned dual-head
+    VideoMAE model.
 
     Parameters
     ----------
@@ -270,7 +289,14 @@ def classify_foul(frames: list[np.ndarray]) -> dict:
     Returns
     -------
     dict
-        {"foul_type": str, "confidence": float}
+        {
+            "foul_type": str,
+            "confidence": float,
+            "severity": str,
+            "severity_confidence": float,
+            "action_class_probs": dict[str, float],
+            "severity_class_probs": dict[str, float],
+        }
         foul_type is one of: tackle, handball, obstruction, simulation,
         push, none.
 
@@ -278,32 +304,70 @@ def classify_foul(frames: list[np.ndarray]) -> dict:
     ------
     ValueError
         If no valid frames are provided.
+    FileNotFoundError
+        If the fine-tuned checkpoint is missing.
     RuntimeError
-        If the underlying model fails to load (e.g. network failure).
+        If the underlying model fails to load (e.g. network failure or
+        architecture/checkpoint mismatch).
     """
     prepared_frames = _prepare_frames(frames)
-    model, processor, device = _load_model()
+    model, transform, device, action_classes, severity_classes = _load_model()
 
-    inputs = processor(list(prepared_frames), return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    pixel_values = torch.stack(
+        [transform(frame) for frame in prepared_frames]
+    ).unsqueeze(0).to(device)  # (1, NUM_FRAMES, 3, IMG_SIZE, IMG_SIZE)
 
     with torch.no_grad():
-        outputs = model(**inputs)
-        logits = outputs.logits.detach().cpu()
+        action_logits, severity_logits = model(pixel_values)
 
-    id2label = model.config.id2label
-    result = _map_kinetics_logits_to_foul(logits, id2label)
+    action_probs = F.softmax(action_logits, dim=-1)[0].cpu()
+    severity_probs = F.softmax(severity_logits, dim=-1)[0].cpu()
 
-    assert result["foul_type"] in FOUL_TYPES, (
-        f"Internal error: produced invalid foul_type '{result['foul_type']}'"
-    )
+    action_idx = int(torch.argmax(action_probs).item())
+    action_label = action_classes[action_idx]
+    confidence = float(action_probs[action_idx])
+
+    severity_idx = int(torch.argmax(severity_probs).item())
+    severity = severity_classes[severity_idx]
+    severity_confidence = float(severity_probs[severity_idx])
+
+    if action_label not in ACTION_TO_FOUL_TYPE:
+        logger.warning(
+            "Unexpected action label '%s' not present in ACTION_TO_FOUL_TYPE; "
+            "falling back to foul_type='none'.",
+            action_label,
+        )
+    foul_type = ACTION_TO_FOUL_TYPE.get(action_label, "none")
+
+    action_class_probs = {
+        action_classes[i]: float(action_probs[i]) for i in range(len(action_classes))
+    }
+    severity_class_probs = {
+        severity_classes[i]: float(severity_probs[i])
+        for i in range(len(severity_classes))
+    }
+
+    result = {
+        "foul_type": foul_type,
+        "confidence": confidence,
+        "severity": severity,
+        "severity_confidence": severity_confidence,
+        "action_class_probs": action_class_probs,
+        "severity_class_probs": severity_class_probs,
+    }
+
+    if result["foul_type"] not in FOUL_TYPES:
+        raise RuntimeError(
+            f"Internal error: produced invalid foul_type '{result['foul_type']}'"
+        )
+
     return result
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
-    print(f"Running smoke test for foul_classifier.py (MODEL_ID='{MODEL_ID}')...")
+    print(f"Running smoke test for foul_classifier.py (checkpoint='{CHECKPOINT_PATH}')...")
     rng = np.random.default_rng(seed=42)
     dummy_frames = [
         rng.integers(0, 256, size=(224, 224, 3), dtype=np.uint8) for _ in range(16)
@@ -311,3 +375,43 @@ if __name__ == "__main__":
 
     result = classify_foul(dummy_frames)
     print("Smoke test result:", result)
+
+    if result["foul_type"] not in FOUL_TYPES:
+        raise RuntimeError(
+            f"FAIL: foul_type '{result['foul_type']}' not in FOUL_TYPES {FOUL_TYPES}"
+        )
+
+    if len(result["action_class_probs"]) != 9:
+        raise RuntimeError(
+            f"FAIL: expected 9 action classes, got {len(result['action_class_probs'])}"
+        )
+
+    if len(result["severity_class_probs"]) != 4:
+        raise RuntimeError(
+            f"FAIL: expected 4 severity classes, got {len(result['severity_class_probs'])}"
+        )
+
+    for name, probs in (
+        ("action_class_probs", result["action_class_probs"]),
+        ("severity_class_probs", result["severity_class_probs"]),
+    ):
+        values = list(probs.values())
+        if any(np.isnan(v) or np.isinf(v) for v in values):
+            raise RuntimeError(f"FAIL: {name} contains NaN/inf: {probs}")
+        total = sum(values)
+        if abs(total - 1.0) > 1e-4:
+            raise RuntimeError(f"FAIL: {name} sums to {total}, expected 1.0 (+/- 1e-4)")
+
+    if not (0.0 <= result["confidence"] <= 1.0):
+        raise RuntimeError(f"FAIL: confidence {result['confidence']} not in [0, 1]")
+
+    if not (0.0 <= result["severity_confidence"] <= 1.0):
+        raise RuntimeError(
+            f"FAIL: severity_confidence {result['severity_confidence']} not in [0, 1]"
+        )
+
+    print(
+        "PASS: foul_type valid, both action_class_probs (9) and "
+        "severity_class_probs (4) are valid probability distributions "
+        "(sum to 1.0, no NaN/inf), confidences in [0, 1]."
+    )

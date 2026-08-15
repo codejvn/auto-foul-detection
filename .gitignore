@@ -1,0 +1,6 @@
+.env
+mvfoul_extracted/
+docs/
+reference_repo/
+generated_pipeline/
+*.pyc

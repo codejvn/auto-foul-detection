@@ -16,7 +16,7 @@ modules reports confidence below the routing threshold (0.65); unambiguous
 cases go straight to the deterministic ruling engine.
 
 Usage:
-    python pipeline.py clip.mp4 [--num-frames 16]
+    python pipeline.py clip.mp4 [--num-frames 16] [--skip-judgment-layer | --with-judgment-layer]
 
 Programmatic usage:
     from pipeline import run_pipeline
@@ -84,7 +84,9 @@ def _log(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
-def run_pipeline(video_path: str, num_frames: int = 16) -> dict[str, Any]:
+def run_pipeline(
+    video_path: str, num_frames: int = 16, use_judgment_layer: bool = True
+) -> dict[str, Any]:
     """Run the full foul detection pipeline on a single video clip.
 
     Executes each stage strictly in sequence (never in parallel) so that at most
@@ -94,6 +96,13 @@ def run_pipeline(video_path: str, num_frames: int = 16) -> dict[str, Any]:
     Args:
         video_path: Path to the input video clip.
         num_frames: Number of frames to sample from the clip for analysis.
+        use_judgment_layer: When True (default), Stage 7 calls the Gemini
+            judgment layer for ambiguous cases (any module confidence below
+            ``LOW_CONFIDENCE_THRESHOLD``). When False, Stage 7 is bypassed
+            entirely -- the four module outputs go straight to
+            ``ruling_engine`` with no escalation, and ``low_confidence_modules``
+            is still computed/flagged (it is needed by the ruling and by
+            calibration scoring) even though no Gemini call is made.
 
     Returns:
         The final ruling dictionary produced by ``ruling_engine.make_ruling``.
@@ -182,7 +191,7 @@ def run_pipeline(video_path: str, num_frames: int = 16) -> dict[str, Any]:
     ]
 
     judgment: dict[str, Any] | None = None
-    if low_confidence_modules:
+    if use_judgment_layer and low_confidence_modules:
         _log(
             "[7/8] Judgment layer INVOKED: low-confidence modules "
             f"(< {LOW_CONFIDENCE_THRESHOLD}): {', '.join(low_confidence_modules)}"
@@ -208,6 +217,13 @@ def run_pipeline(video_path: str, num_frames: int = 16) -> dict[str, Any]:
                 "with module outputs only. The ruling will still flag the "
                 "low-confidence modules."
             )
+    elif low_confidence_modules:
+        _log(
+            "[7/8] Judgment layer BYPASSED (--skip-judgment-layer): "
+            f"{len(low_confidence_modules)} low-confidence module(s) "
+            f"({', '.join(low_confidence_modules)}) routed straight to ruling_engine "
+            "with no escalation."
+        )
     else:
         _log(
             "[7/8] Judgment layer SKIPPED: all module confidences >= "
@@ -263,6 +279,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=16,
         help="Number of frames to sample from the clip for analysis (default: 16).",
     )
+    jl_group = parser.add_mutually_exclusive_group()
+    jl_group.add_argument(
+        "--skip-judgment-layer", action="store_true",
+        help="Bypass the Gemini judgment layer entirely; route module outputs straight to "
+             "ruling_engine even when confidence is low (no API call, no escalation).",
+    )
+    jl_group.add_argument(
+        "--with-judgment-layer", action="store_true",
+        help="Force the judgment layer on for ambiguous cases (the default). Explicit opt-in for "
+             "spot-checking individual clips with full judgment-layer reasoning.",
+    )
     return parser
 
 
@@ -276,7 +303,10 @@ def main() -> None:
     with status 2.
     """
     if len(sys.argv) == 1:
-        _log("Usage: python pipeline.py <video_path> [--num-frames 16]")
+        _log(
+            "Usage: python pipeline.py <video_path> [--num-frames 16] "
+            "[--skip-judgment-layer | --with-judgment-layer]"
+        )
         sys.exit(2)
 
     parser = _build_arg_parser()
@@ -287,8 +317,14 @@ def main() -> None:
         _log(f"Error: video file not found: {video_path}")
         sys.exit(1)
 
+    use_judgment_layer = not args.skip_judgment_layer
+
     try:
-        ruling = run_pipeline(str(video_path), num_frames=args.num_frames)
+        ruling = run_pipeline(
+            str(video_path),
+            num_frames=args.num_frames,
+            use_judgment_layer=use_judgment_layer,
+        )
     except PipelineStageError as exc:
         _log(f"Error: pipeline failed at stage '{exc.stage_name}': {exc.original_exception}")
         sys.exit(1)

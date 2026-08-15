@@ -40,6 +40,7 @@ Design notes
 from __future__ import annotations
 
 import logging
+import sys
 from typing import Optional
 
 import numpy as np
@@ -56,22 +57,29 @@ logger = logging.getLogger(__name__)
 # a generic Kinetics-400 action-recognition checkpoint, whose predictions
 # are translated into foul categories via keyword matching further below.
 #
-# To swap in a SoccerNet fine-tuned checkpoint that outputs a direct
-# 6-class head (tackle/handball/obstruction/simulation/push/none), do
-# EXACTLY this:
+# `train_foul_classifier.py` fine-tunes this exact checkpoint into a direct
+# 6-class head and saves it to `./checkpoints/videomae-foul-best.pt`. To
+# activate that fine-tuned checkpoint here, do EXACTLY this:
 #
-#   1. Change the constant below to your fine-tuned checkpoint id/path, e.g.:
-#          MODEL_ID = "your-org/videomae-soccernet-foul-classifier"
-#   2. Ensure that checkpoint's config.id2label maps indices 0-5 directly
-#      to {"tackle", "handball", "obstruction", "simulation", "push", "none"}.
-#   3. In `classify_foul`, replace the call to `_map_kinetics_logits_to_foul`
-#      with a direct softmax + argmax over the 6-class logits, e.g.:
+#   1. Load the checkpoint dict from './checkpoints/videomae-foul-best.pt'
+#      via `torch.load(...)`. It has keys: 'model_state_dict',
+#      'class_names', 'epoch', 'val_f1'.
+#   2. Before loading `model_state_dict`, replace the model's classification
+#      head with `torch.nn.Linear(768, len(CLASS_NAMES))` (768 = VideoMAE-
+#      base hidden size; this must match the head shape
+#      `train_foul_classifier.py` trains).
+#   3. Use the checkpoint's 'class_names' list (index order: tackle,
+#      handball, obstruction, simulation, push, none) to map the argmax
+#      output index directly to a foul type string — no keyword matching
+#      needed, e.g.:
 #          probs = F.softmax(logits, dim=-1)[0]
 #          idx = int(torch.argmax(probs).item())
-#          label = model.config.id2label[idx]
+#          label = checkpoint["class_names"][idx]
 #          confidence = float(probs[idx].item())
 #          return {"foul_type": label, "confidence": confidence}
-#   4. DELETE the `_map_kinetics_logits_to_foul` function and the
+#   4. In `classify_foul`, replace the call to `_map_kinetics_logits_to_foul`
+#      with the direct softmax + argmax over the 6-class logits shown above.
+#   5. DELETE the `_map_kinetics_logits_to_foul` function and the
 #      `KINETICS_LABEL_TO_FOUL_KEYWORDS` mapping dict entirely — they are
 #      Kinetics-400-specific compatibility shims that no longer apply once
 #      the model natively outputs foul classes.
@@ -215,6 +223,12 @@ def _map_kinetics_logits_to_foul(logits: torch.Tensor, id2label: dict[int, str])
     Returns {"foul_type": str, "confidence": float}.
     """
     probs = F.softmax(logits, dim=-1)[0]
+
+    debug_topk = torch.topk(probs, k=min(10, probs.shape[-1]))
+    print("[foul_classifier] top-10 Kinetics predictions:", file=sys.stderr)
+    for idx, prob in zip(debug_topk.indices.tolist(), debug_topk.values.tolist()):
+        print(f"  {prob:.3f}  {id2label.get(idx, '<unknown>')}", file=sys.stderr)
+
     topk = torch.topk(probs, k=min(TOP_K, probs.shape[-1]))
     top_indices = topk.indices.tolist()
     top_probs = topk.values.tolist()

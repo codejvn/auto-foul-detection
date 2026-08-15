@@ -2,14 +2,13 @@
 judgment_layer.py
 =================
 
-Claude (Sonnet 5) judgment layer for the auto-foul-detection pipeline.
+Gemini (gemini-2.5-flash) judgment layer for the auto-foul-detection pipeline.
 
 This module is ONLY invoked for ambiguous cases: when any upstream CV
 module reports confidence below the routing threshold (0.65), the pipeline
-hands the full set of structured module outputs to Claude Sonnet 5, which
-acts as a referee judgment layer. Unambiguous cases never reach this
-module -- they go straight from the CV modules to the deterministic
-``ruling_engine``.
+hands the full set of structured module outputs to Gemini, which acts as
+a referee judgment layer. Unambiguous cases never reach this module --
+they go straight from the CV modules to the deterministic ``ruling_engine``.
 
 Division of authority
 ---------------------
@@ -40,22 +39,29 @@ Output contract (consumed by ruling_engine.make_ruling(judgment=...))
 
 API usage
 ---------
-Uses the official ``anthropic`` Python SDK against ``claude-sonnet-5``
-with structured JSON output (``output_config.format`` with a
-``json_schema``), so the response is guaranteed to be valid JSON matching
-the output contract's shape. Requires the ``ANTHROPIC_API_KEY``
-environment variable; a clear ``RuntimeError`` is raised when it is
-missing.
+Uses the official ``google-genai`` Python SDK (``from google import genai``)
+against ``gemini-2.5-flash`` with structured JSON output
+(``response_mime_type="application/json"`` + ``response_schema``), so the
+response is guaranteed to be valid JSON matching the output contract's
+shape. Requires the ``GEMINI_API_KEY`` environment variable, loaded from a
+``.env`` file via ``python-dotenv`` if not already set; a clear
+``RuntimeError`` is raised when it is missing.
+
+Note on this machine: outbound HTTPS is TLS-intercepted, which breaks
+default certifi-based verification used by httpx (which this SDK uses
+internally). This module calls ``truststore.inject_into_ssl()`` at import
+time to verify against the OS trust store instead -- a no-op improvement
+on machines without interception.
 
 SWAP HOOK (model / caller)
 --------------------------
-``MODEL_ID`` is a module constant -- point it at a different Claude model
+``MODEL_ID`` is a module constant -- point it at a different Gemini model
 to swap the judge. For testing (or an offline fallback), reassign the
-module-level ``CLAUDE_CALLER`` callable, which has the signature
+module-level ``GEMINI_CALLER`` callable, which has the signature
 ``(module_outputs: dict) -> str`` and returns the model's raw JSON text:
 
     import judgment_layer
-    judgment_layer.CLAUDE_CALLER = my_fake_caller
+    judgment_layer.GEMINI_CALLER = my_fake_caller
 
 This mirrors the FRAME_SELECTOR / CUT_DETECTOR conventions used elsewhere
 in this pipeline. The ``__main__`` smoke test uses exactly this hook to
@@ -70,17 +76,33 @@ import json
 import os
 from typing import Callable
 
+import truststore
+from dotenv import load_dotenv
+from google.genai import types as genai_types
+
+# Some deployment environments (e.g. corporate TLS-intercepting proxies)
+# break the default certifi-based verification httpx/google-genai use.
+# truststore verifies against the OS trust store instead, which handles
+# locally-installed interception certs; it's a no-op improvement elsewhere.
+truststore.inject_into_ssl()
+
+# Loads GEMINI_API_KEY (and any other vars) from a .env file. Searches this
+# file's directory and its parents, so a repo-root .env is found regardless
+# of the caller's working directory. Does not override a variable already
+# set in the real environment.
+load_dotenv()
+
 # ---------------------------------------------------------------------------
 # Configuration / swap hooks
 # ---------------------------------------------------------------------------
 
-#: SWAP HOOK: the Claude model used as the judge. Sonnet 5 per the project
-#: plan (strong judgment quality at Sonnet cost; ambiguous cases only).
-MODEL_ID: str = "claude-sonnet-5"
+#: SWAP HOOK: the Gemini model used as the judge. gemini-2.5-flash per the
+#: project plan (strong judgment quality at low cost/latency; ambiguous
+#: cases only).
+MODEL_ID: str = "gemini-2.5-flash"
 
-#: Max output tokens for the judgment call. Sonnet 5 runs adaptive thinking
-#: by default and thinking tokens count against this limit, so it is sized
-#: well above the (small) JSON answer itself.
+#: Max output tokens for the judgment call. Sized well above the (small)
+#: JSON answer itself to leave headroom for the model's reasoning.
 MAX_TOKENS: int = 8192
 
 #: Valid foul types -- must stay in sync with foul_classifier.FOUL_TYPES.
@@ -170,11 +192,40 @@ JUDGMENT_SCHEMA: dict = {
     "additionalProperties": False,
 }
 
-#: SWAP HOOK: the callable that actually talks to Claude. Signature:
+#: Gemini structured-output schema (google.genai.types.Schema), mirroring
+#: JUDGMENT_SCHEMA above. Gemini's schema dialect has no additionalProperties
+#: control, so strictness here comes entirely from the enum lists plus the
+#: post-hoc validation in _parse_and_validate_judgment.
+GEMINI_RESPONSE_SCHEMA: genai_types.Schema = genai_types.Schema(
+    type=genai_types.Type.OBJECT,
+    properties={
+        "foul_type": genai_types.Schema(
+            type=genai_types.Type.STRING,
+            enum=list(FOUL_TYPES),
+            description="The judged foul type, possibly overriding the classifier.",
+        ),
+        "severity": genai_types.Schema(
+            type=genai_types.Type.STRING,
+            enum=list(SEVERITIES),
+            description="The judged severity under IFAB definitions.",
+        ),
+        "reasoning": genai_types.Schema(
+            type=genai_types.Type.STRING,
+            description="Brief justification grounded in the module evidence.",
+        ),
+        "confidence": genai_types.Schema(
+            type=genai_types.Type.NUMBER,
+            description="Judgment confidence in [0, 1].",
+        ),
+    },
+    required=["foul_type", "severity", "reasoning", "confidence"],
+)
+
+#: SWAP HOOK: the callable that actually talks to Gemini. Signature:
 #: ``(module_outputs: dict) -> str`` returning the raw JSON response text.
 #: The smoke test replaces this with a mock; an offline deployment could
 #: point it at a local model. See module docstring.
-CLAUDE_CALLER: Callable[[dict], str]
+GEMINI_CALLER: Callable[[dict], str]
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +234,7 @@ CLAUDE_CALLER: Callable[[dict], str]
 
 
 def evaluate_ambiguous_case(module_outputs: dict) -> dict:
-    """Ask the Claude judgment layer to adjudicate an ambiguous case.
+    """Ask the Gemini judgment layer to adjudicate an ambiguous case.
 
     Args:
         module_outputs: Dict with keys ``"contact"``, ``"foul"``,
@@ -200,25 +251,25 @@ def evaluate_ambiguous_case(module_outputs: dict) -> dict:
     Raises:
         ValueError: If ``module_outputs`` is missing required keys, or the
             model response fails validation against the output contract.
-        RuntimeError: If ``ANTHROPIC_API_KEY`` is not set, the ``anthropic``
+        RuntimeError: If ``GEMINI_API_KEY`` is not set, the ``google-genai``
             package is not installed, or the API call fails.
     """
     _validate_input(module_outputs)
-    raw_response = CLAUDE_CALLER(module_outputs)
+    raw_response = GEMINI_CALLER(module_outputs)
     return _parse_and_validate_judgment(raw_response)
 
 
 # ---------------------------------------------------------------------------
-# Claude API call
+# Gemini API call
 # ---------------------------------------------------------------------------
 
 
-def _call_claude_api(module_outputs: dict) -> str:
-    """Send the evidence to claude-sonnet-5 and return its raw JSON text.
+def _call_gemini_api(module_outputs: dict) -> str:
+    """Send the evidence to gemini-2.5-flash and return its raw JSON text.
 
-    Uses structured outputs (``output_config.format`` with
-    ``JUDGMENT_SCHEMA``) so the returned text block is guaranteed to be
-    valid JSON matching the judgment contract's shape.
+    Uses structured outputs (``response_mime_type="application/json"`` +
+    ``response_schema=GEMINI_RESPONSE_SCHEMA``) so the returned text is
+    guaranteed to be valid JSON matching the judgment contract's shape.
 
     Args:
         module_outputs: The validated module-output dict.
@@ -227,29 +278,30 @@ def _call_claude_api(module_outputs: dict) -> str:
         The model's response text (a JSON object string).
 
     Raises:
-        RuntimeError: If ``ANTHROPIC_API_KEY`` is unset, the SDK is not
+        RuntimeError: If ``GEMINI_API_KEY`` is unset, the SDK is not
             installed, or the API call fails (with the failure category --
             auth, rate limit, connection, API error -- in the message).
     """
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    if not os.environ.get("GEMINI_API_KEY"):
         raise RuntimeError(
-            "The judgment layer requires an Anthropic API key: the "
-            "ANTHROPIC_API_KEY environment variable is not set. Ambiguous "
-            "cases (any module confidence < 0.65) are routed to Claude "
+            "The judgment layer requires a Gemini API key: the "
+            "GEMINI_API_KEY environment variable is not set. Ambiguous "
+            "cases (any module confidence < 0.65) are routed to Gemini "
             f"({MODEL_ID}) for adjudication and cannot be processed "
-            "without it. Set ANTHROPIC_API_KEY, or route the case to "
+            "without it. Set GEMINI_API_KEY, or route the case to "
             "human review instead."
         )
 
     try:
-        import anthropic
+        from google import genai
+        from google.genai import errors as genai_errors
     except ImportError as exc:
         raise RuntimeError(
-            "The judgment layer requires the 'anthropic' package "
-            "(pip install anthropic); it is listed in requirements.txt."
+            "The judgment layer requires the 'google-genai' package "
+            "(pip install google-genai); it is listed in requirements.txt."
         ) from exc
 
-    client = anthropic.Anthropic()
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
     user_message = (
         "Adjudicate this potential foul. Structured evidence from the CV "
@@ -258,57 +310,65 @@ def _call_claude_api(module_outputs: dict) -> str:
     )
 
     try:
-        response = client.messages.create(
+        response = client.models.generate_content(
             model=MODEL_ID,
-            max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT,
-            output_config={
-                "format": {"type": "json_schema", "schema": JUDGMENT_SCHEMA}
-            },
-            messages=[{"role": "user", "content": user_message}],
+            contents=user_message,
+            config=genai.types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                max_output_tokens=MAX_TOKENS,
+                response_mime_type="application/json",
+                response_schema=GEMINI_RESPONSE_SCHEMA,
+            ),
         )
-    except anthropic.AuthenticationError as exc:
+    except genai_errors.ClientError as exc:
+        status = getattr(exc, "code", None)
+        if status == 401 or status == 403:
+            raise RuntimeError(
+                "Judgment layer authentication failed: the GEMINI_API_KEY "
+                "is set but was rejected by the API. Check that the key is "
+                "valid and active."
+            ) from exc
+        if status == 429:
+            raise RuntimeError(
+                "Judgment layer rate-limited by the Gemini API. Wait and "
+                "retry this clip, or reduce concurrent validator workers."
+            ) from exc
         raise RuntimeError(
-            "Judgment layer authentication failed: the ANTHROPIC_API_KEY "
-            "is set but was rejected by the API. Check that the key is "
-            "valid and active."
+            f"Judgment layer API call failed with HTTP {status}: {exc}"
         ) from exc
-    except anthropic.RateLimitError as exc:
+    except genai_errors.ServerError as exc:
         raise RuntimeError(
-            "Judgment layer rate-limited by the Anthropic API. The SDK "
-            "already retried with backoff; wait and retry this clip, or "
-            "reduce concurrent validator workers."
+            f"Judgment layer Gemini server error: {exc}"
         ) from exc
-    except anthropic.APIConnectionError as exc:
+    except Exception as exc:  # noqa: BLE001 - network/connection failures
         raise RuntimeError(
-            "Judgment layer could not reach the Anthropic API (network "
-            "error). Check connectivity and retry."
-        ) from exc
-    except anthropic.APIStatusError as exc:
-        raise RuntimeError(
-            f"Judgment layer API call failed with HTTP {exc.status_code}: "
-            f"{exc.message}"
+            f"Judgment layer could not reach the Gemini API: {exc}"
         ) from exc
 
-    if response.stop_reason == "refusal":
+    if not response.candidates:
         raise RuntimeError(
-            "Judgment layer request was refused by the model; route this "
-            "clip to human review."
+            "Judgment layer response contained no candidates (the request "
+            "may have been blocked); route this clip to human review."
         )
 
-    text = next(
-        (block.text for block in response.content if block.type == "text"),
-        None,
-    )
+    finish_reason = response.candidates[0].finish_reason
+    if finish_reason is not None and str(finish_reason) not in ("STOP", "FinishReason.STOP"):
+        raise RuntimeError(
+            "Judgment layer request did not complete normally "
+            f"(finish_reason={finish_reason!r}); route this clip to human "
+            "review."
+        )
+
+    text = response.text
     if text is None:
         raise RuntimeError(
-            "Judgment layer response contained no text block "
-            f"(stop_reason={response.stop_reason!r})."
+            "Judgment layer response contained no text "
+            f"(finish_reason={finish_reason!r})."
         )
     return text
 
 
-CLAUDE_CALLER = _call_claude_api
+GEMINI_CALLER = _call_gemini_api
 
 
 # ---------------------------------------------------------------------------
@@ -355,11 +415,11 @@ def _parse_and_validate_judgment(raw_response: str) -> dict:
     """Parse the model's JSON text and enforce the output contract.
 
     Structured outputs already guarantee the shape when the real API is
-    used, but the caller is swappable (CLAUDE_CALLER), so the contract is
+    used, but the caller is swappable (GEMINI_CALLER), so the contract is
     re-validated here regardless of backend.
 
     Args:
-        raw_response: The raw JSON text returned by the Claude caller.
+        raw_response: The raw JSON text returned by the Gemini caller.
 
     Returns:
         The validated judgment dict, with ``confidence`` coerced to float
@@ -425,10 +485,10 @@ def _example_ambiguous_input() -> dict:
 
 
 def _run_smoke_test() -> None:
-    """Self-contained smoke test: mocks the Claude API call via the
-    CLAUDE_CALLER swap hook, so it needs no API key and no network."""
-    original_caller = CLAUDE_CALLER
-    original_key = os.environ.pop("ANTHROPIC_API_KEY", None)
+    """Self-contained smoke test: mocks the Gemini API call via the
+    GEMINI_CALLER swap hook, so it needs no API key and no network."""
+    original_caller = GEMINI_CALLER
+    original_key = os.environ.pop("GEMINI_API_KEY", None)
     module = __import__(__name__)
 
     try:
@@ -449,7 +509,7 @@ def _run_smoke_test() -> None:
             captured_inputs.append(module_outputs)
             return json.dumps(mocked_judgment)
 
-        module.CLAUDE_CALLER = _mock_caller
+        module.GEMINI_CALLER = _mock_caller
         print("[smoke test] Evaluating ambiguous case with mocked API...")
         result = evaluate_ambiguous_case(_example_ambiguous_input())
         print(f"[smoke test]   judgment: {json.dumps(result, indent=2)}")
@@ -468,7 +528,7 @@ def _run_smoke_test() -> None:
               "(reckless -> careless).")
 
         # 3. Confidence clamping.
-        module.CLAUDE_CALLER = lambda _: json.dumps(
+        module.GEMINI_CALLER = lambda _: json.dumps(
             {**mocked_judgment, "confidence": 1.7}
         )
         clamped = evaluate_ambiguous_case(_example_ambiguous_input())
@@ -483,7 +543,7 @@ def _run_smoke_test() -> None:
             (json.dumps({**mocked_judgment, "foul_type": "headbutt"}),
              "invalid foul_type"),
         ]:
-            module.CLAUDE_CALLER = lambda _, r=bad_response: r
+            module.GEMINI_CALLER = lambda _, r=bad_response: r
             try:
                 evaluate_ambiguous_case(_example_ambiguous_input())
             except ValueError as exc:
@@ -492,7 +552,7 @@ def _run_smoke_test() -> None:
                 raise AssertionError(f"Expected ValueError for {label}")
 
         # 5. Malformed input is rejected before any API call.
-        module.CLAUDE_CALLER = _mock_caller
+        module.GEMINI_CALLER = _mock_caller
         try:
             evaluate_ambiguous_case({"contact": {"contact": True}})
         except ValueError as exc:
@@ -501,12 +561,12 @@ def _run_smoke_test() -> None:
             raise AssertionError("Expected ValueError for malformed input")
 
         # 6. Missing API key raises a clear RuntimeError on the real path.
-        module.CLAUDE_CALLER = original_caller
-        assert "ANTHROPIC_API_KEY" not in os.environ
+        module.GEMINI_CALLER = original_caller
+        assert "GEMINI_API_KEY" not in os.environ
         try:
             evaluate_ambiguous_case(_example_ambiguous_input())
         except RuntimeError as exc:
-            assert "ANTHROPIC_API_KEY" in str(exc)
+            assert "GEMINI_API_KEY" in str(exc)
             print(f"[smoke test] Correctly raised RuntimeError without "
                   f"API key: {exc}")
         else:
@@ -514,9 +574,9 @@ def _run_smoke_test() -> None:
 
         print("[smoke test] PASSED.")
     finally:
-        module.CLAUDE_CALLER = original_caller
+        module.GEMINI_CALLER = original_caller
         if original_key is not None:
-            os.environ["ANTHROPIC_API_KEY"] = original_key
+            os.environ["GEMINI_API_KEY"] = original_key
 
 
 if __name__ == "__main__":

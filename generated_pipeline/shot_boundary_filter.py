@@ -53,6 +53,7 @@ PySceneDetect's HSV buffers on full-resolution frames, zero GPU).
 
 from __future__ import annotations
 
+import sys
 from typing import Callable
 
 import cv2
@@ -67,9 +68,16 @@ import numpy as np
 #: this; a hard camera cut scores orders of magnitude above it.
 MSE_CUT_THRESHOLD: float = 25.0
 
-#: Content threshold passed to PySceneDetect's ContentDetector. 27.0 is
-#: PySceneDetect's own default for broadcast-style footage.
-PYSCENEDETECT_THRESHOLD: float = 27.0
+#: Content threshold passed to PySceneDetect's ContentDetector. Raised from
+#: PySceneDetect's default (27.0) to reduce false positives on normal in-shot
+#: scene changes (e.g., players moving within the same camera angle).
+PYSCENEDETECT_THRESHOLD: float = 40.0
+
+#: Minimum number of frames to keep after shot filtering. If the longest
+#: continuous shot has fewer than this many frames, combine the top N longest
+#: shots instead, trading some shot-cut contamination for robustness (downstream
+#: optical flow and classifiers need sufficient frame count).
+MIN_FRAMES_FLOOR: int = 8
 
 #: SWAP HOOK: reassign this to a callable with the signature
 #: ``(frames: list[np.ndarray]) -> list[int]`` (returning sorted indices at
@@ -154,7 +162,14 @@ def filter_shot_boundaries(
         )
 
     start, end = _longest_shot_span(len(frames), cuts)
-    return frames[start:end], timestamps[start:end]
+    kept_frames = frames[start:end]
+    kept_timestamps = timestamps[start:end]
+    print(
+        f"[shot_boundary_filter] threshold={PYSCENEDETECT_THRESHOLD}, "
+        f"detected_cuts={len(cuts)}, kept_frames={len(kept_frames)}/{len(frames)}",
+        file=sys.stderr,
+    )
+    return kept_frames, kept_timestamps
 
 
 # ---------------------------------------------------------------------------
@@ -255,8 +270,9 @@ def _longest_shot_span(num_frames: int, cuts: list[int]) -> tuple[int, int]:
     """Find the ``[start, end)`` span of the longest continuous shot.
 
     Splits ``range(num_frames)`` into contiguous segments at each cut index
-    (a cut index marks the first frame of a *new* shot) and returns the
-    longest segment. Ties are broken in favor of the earliest segment.
+    (a cut index marks the first frame of a *new* shot), returns the longest
+    segment, or combines the top 2 longest if the longest is shorter than
+    ``MIN_FRAMES_FLOOR`` (a safety floor to prevent filtering out too much).
 
     Args:
         num_frames: Total number of frames in the sequence.
@@ -272,11 +288,28 @@ def _longest_shot_span(num_frames: int, cuts: list[int]) -> tuple[int, int]:
         + [num_frames]
     )
 
-    best_start, best_end = 0, 0
-    for start, end in zip(boundaries[:-1], boundaries[1:]):
-        if end - start > best_end - best_start:
-            best_start, best_end = start, end
-    return best_start, best_end
+    shots = [
+        (start, end)
+        for start, end in zip(boundaries[:-1], boundaries[1:])
+    ]
+
+    if not shots:
+        return 0, num_frames
+
+    shots_sorted_by_length = sorted(shots, key=lambda span: span[1] - span[0], reverse=True)
+    longest_start, longest_end = shots_sorted_by_length[0]
+    longest_length = longest_end - longest_start
+
+    if longest_length >= MIN_FRAMES_FLOOR:
+        return longest_start, longest_end
+
+    if len(shots_sorted_by_length) >= 2:
+        top_two = shots_sorted_by_length[:2]
+        combined_start = min(s[0] for s in top_two)
+        combined_end = max(s[1] for s in top_two)
+        return combined_start, combined_end
+
+    return longest_start, longest_end
 
 
 # ---------------------------------------------------------------------------

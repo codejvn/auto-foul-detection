@@ -2,7 +2,7 @@
 
 ## Agent workflow
 This project uses the `/subagent-driven-development` skill for all implementation work.
-- **Architect:** Fable 5 (current model) — planning, decomposition, review
+- **Architect:** Opus 5 (current model) — planning, decomposition, review
 - **Subagents:** Sonnet (`claude-sonnet-4-6`) — all code writing and execution tasks
 
 When given any implementation task, invoke `/subagent-driven-development` with Sonnet as the subagent model.
